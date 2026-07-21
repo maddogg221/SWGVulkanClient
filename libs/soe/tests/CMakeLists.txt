@@ -1,0 +1,73 @@
+add_executable(soe_tests
+    test_main.cpp
+    test_packetbuffer.cpp
+    test_crc32.cpp
+    test_messagehash.cpp
+    test_xorcipher.cpp
+    test_compression.cpp
+    test_messagedispatcher.cpp
+    test_fragmentreassembler.cpp
+    test_threadsafequeue.cpp
+    test_swgproto_creatureobject.cpp
+    test_swgproto_creatureobject_base6.cpp
+    test_swgproto_creatureobject_base4.cpp
+    test_swgproto_installationobject.cpp
+    test_swgproto_cellobject.cpp
+    test_swgproto_guildobject.cpp
+    test_swgproto_chatsystemmessage.cpp
+    test_swgproto_playerobject.cpp
+    test_swgproto_playerobject_base8.cpp
+    test_swgproto_playerobject_base9.cpp
+    test_swgproto_tangibleobject.cpp
+    test_swgproto_weaponobject.cpp
+    test_swgproto_transform.cpp
+    test_swgproto_objcontroller.cpp
+    test_swgproto_showflytext.cpp
+    test_swgproto_commandqueueremove.cpp
+    test_swgproto_commandqueueenqueue.cpp
+    test_swgproto_objectmenuselect.cpp
+    test_swgproto_datatransformwithparent.cpp
+    test_swgproto_resourcecontainer.cpp
+    test_swgproto_factorycrate.cpp
+    test_swgproto_staticobject.cpp
+    test_swgproto_harvesterobject.cpp
+    test_swgproto_weaponranges.cpp
+    test_swgproto_spatialchat.cpp
+    test_swgproto_commandqueueadd.cpp
+    test_swgproto_emote.cpp
+    test_swgproto_flourish.cpp
+    test_swgproto_buffs.cpp
+    test_swgproto_startinglocationlistmessage.cpp
+    test_swgproto_combatspam.cpp
+    test_swgproto_harvesterresourcedatamessage.cpp
+    test_swgproto_scenedestroyobject.cpp
+    test_swgproto_objectmenuresponse.cpp
+    test_terrain_trnfile.cpp
+    test_terrain_multifractal.cpp
+    test_terrain_generator.cpp
+    test_terrain_queryheight.cpp
+    test_terrain_querycolor.cpp
+    test_terrain_chunkmesh.cpp
+    test_objcontrollerdispatcher.cpp
+    test_objectstatedispatcher.cpp
+    test_schema_engine.cpp
+    test_worldmodel_objectstore.cpp
+    test_worldmodel_singletonregistry.cpp
+    test_assets_iffreader.cpp
+    test_assets_trearchive.cpp
+    test_assets_sharedobjecttemplate.cpp
+    test_assets_appearancetemplate.cpp
+    test_assets_lodfile.cpp
+    test_assets_staticmesh.cpp
+    test_assets_tgaimage.cpp
+    test_assets_skeleton.cpp
+    test_assets_skeletalmesh.cpp
+    test_assets_skeletalappearance.cpp
+    test_assets_buildinglayout.cpp
+    test_assets_shadertemplate.cpp
+    test_assets_ddsimage.cpp
+)
+
+target_link_libraries(soe_tests PRIVATE soe::soe swgproto::swgproto worldmodel::worldmodel assets::assets terrain::terrain doctest::doctest)
+
+add_test(NAME soe_tests COMMAND soe_tests)

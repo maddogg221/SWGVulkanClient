@@ -1,0 +1,8 @@
+build/
+out/
+.cache/
+CMakeUserPresets.json
+
+# If you keep any local notes with real server credentials while working on
+# this project, name them *.local.md - this pattern keeps them out of git.
+*.local.md
