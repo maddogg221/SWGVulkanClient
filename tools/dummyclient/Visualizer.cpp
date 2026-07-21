@@ -2455,21 +2455,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
             // local floor height again, and repeating forever.
             std::optional<float> newFloorHeight;
             float buildingWorldY = 0.0f;
-            // TEMPORARY diagnostic (Phase 20 debugging) - captured inside the
-            // forEach below, printed (throttled) after it, to see live which
-            // cell is actually being selected and what the raw wall/floor
-            // test results are while walking near a wall or up the stairs.
-            // Remove once the real remaining wall/stairs bugs are found.
-            std::optional<size_t> debugCellIndex;
-            DirectX::XMFLOAT3 debugOldLocal{};
-            bool debugBlockedByInteriorCell = false;
-            bool debugBlockedByShell = false;
-            bool debugUsedFlrNavmesh = false;
-            size_t debugCellMeshTriCount = 0;
-            float debugCellMeshYMin = 0.0f;
-            float debugCellMeshYMax = 0.0f;
-            uint64_t debugBuildingObjectId = 0;
-            DirectX::XMFLOAT3 debugBuildingWorldPos{};
             objectStore.forEach([&](const auto& buildingCandidate) {
                 using T = std::decay_t<decltype(buildingCandidate)>;
                 if constexpr (std::is_same_v<T, worldmodel::CellObject> ||
@@ -2497,9 +2482,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     }
                     selfInsideAnyBuildingFootprint = true;
                     buildingWorldY = buildingCandidate.y;
-                    debugBuildingObjectId = buildingCandidate.objectId;
-                    debugBuildingWorldPos = DirectX::XMFLOAT3{buildingCandidate.x, buildingCandidate.y,
-                                                               buildingCandidate.z};
 
                     DirectX::XMFLOAT3 newLocal =
                         worldToBuildingLocal(predictedSelfPos, buildingCandidate);
@@ -2580,11 +2562,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                             segmentBlockedByCollisionMesh(cell.collisionMesh, wallTestFrom,
                                                            wallTestTo)) {
                             blocked = true;
-                            debugBlockedByInteriorCell = true;
                         }
                     }
-                    debugCellIndex = cellIndex;
-                    debugOldLocal = oldLocal;
 
                     // Real bugfix, found live: cell 0 (the exterior shell)
                     // carries the true outer-wall geometry - an interior
@@ -2605,7 +2584,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                         segmentBlockedByCollisionMesh(shell.collisionMesh, wallTestFrom,
                                                        wallTestTo)) {
                         blocked = true;
-                        debugBlockedByShell = true;
                     }
 
                     if (blocked) {
@@ -2657,14 +2635,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                 newFloorHeight = hit2D->y;
                                 persistentFloorTriangleIndex = hit2D->triangleIndex;
                                 persistentFloorTriangleCellIndex = sourceCellIndex;
-                                debugUsedFlrNavmesh = true;
-                                debugCellMeshTriCount = source.floorMesh.triangleVertexIndices.size() / 3;
-                                debugCellMeshYMin = source.floorMesh.positions[0].y;
-                                debugCellMeshYMax = source.floorMesh.positions[0].y;
-                                for (const auto& p : source.floorMesh.positions) {
-                                    debugCellMeshYMin = std::min(debugCellMeshYMin, p.y);
-                                    debugCellMeshYMax = std::max(debugCellMeshYMax, p.y);
-                                }
                                 return;
                             }
                         }
@@ -2676,18 +2646,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                             return;
                         }
                         newFloorHeight = hit;
-                        // TEMPORARY diagnostic (Phase 20 debugging) - the
-                        // real Y range/triangle count of whichever mesh
-                        // actually produced the hit, to tell a genuinely
-                        // flat real collision floor apart from a raycast
-                        // bug hitting the same triangle repeatedly.
-                        debugCellMeshTriCount = source.collisionMesh.indices.size() / 3;
-                        debugCellMeshYMin = source.collisionMesh.positions[0].y;
-                        debugCellMeshYMax = source.collisionMesh.positions[0].y;
-                        for (const auto& p : source.collisionMesh.positions) {
-                            debugCellMeshYMin = std::min(debugCellMeshYMin, p.y);
-                            debugCellMeshYMax = std::max(debugCellMeshYMax, p.y);
-                        }
                     };
                     if (cellIndex.has_value()) {
                         tryFloorHeight((*cells)[*cellIndex], *cellIndex);
@@ -2774,42 +2732,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
             // else: hold predictedSelfPos.y unchanged - the graceful
             // fallback for a real gap in floor-mesh coverage while
             // genuinely indoors (see comment above).
-
-            // TEMPORARY diagnostic print (Phase 20 debugging), throttled to
-            // ~4/sec so it's readable while walking around live. Placed
-            // AFTER the height-resolution chain above (unlike an earlier
-            // version of this same print) so predictedY reflects THIS
-            // frame's real final value, not last frame's stale one.
-            {
-                static Clock::time_point lastDebugPrint;
-                if (selfInsideAnyBuildingFootprint &&
-                    std::chrono::duration<float>(now - lastDebugPrint).count() > 0.25f) {
-                    lastDebugPrint = now;
-                    std::cout << "[COLLISION DEBUG] cell="
-                              << (debugCellIndex.has_value() ? std::to_string(*debugCellIndex)
-                                                              : std::string("NONE"))
-                              << " local=(" << debugOldLocal.x << "," << debugOldLocal.y << ","
-                              << debugOldLocal.z << ")"
-                              << " blockedInterior=" << debugBlockedByInteriorCell
-                              << " blockedShell=" << debugBlockedByShell
-                              << " floorHeight="
-                              << (newFloorHeight.has_value() ? std::to_string(*newFloorHeight)
-                                                              : std::string("NONE"))
-                              << " predictedY=" << predictedSelfPos.y
-                              << " usedFlrNavmesh=" << debugUsedFlrNavmesh
-                              << " cellMeshTris=" << debugCellMeshTriCount
-                              << " cellMeshYRange=(" << debugCellMeshYMin << ".."
-                              << debugCellMeshYMax << ")"
-                              << " buildingId=" << debugBuildingObjectId << " buildingPos=("
-                              << debugBuildingWorldPos.x << "," << debugBuildingWorldPos.y << ","
-                              << debugBuildingWorldPos.z << ")"
-                              << " outdoorTerrainY="
-                              << (terrainSource ? std::to_string(terrainSource->queryHeight(
-                                                       predictedSelfPos.x, predictedSelfPos.z))
-                                                 : std::string("N/A"))
-                              << "\n";
-                }
-            }
 
             // Outbound movement report - real client cadence (MID_DELTA=
             // 400ms, see the constant's own comment), only while actually
