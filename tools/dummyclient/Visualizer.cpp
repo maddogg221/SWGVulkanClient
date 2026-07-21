@@ -474,9 +474,36 @@ std::optional<CellBounds> computeCellBounds(const std::vector<ResolvedSubmesh>& 
 // One real cell's resolved submeshes plus its own real bounds (see
 // CellBounds' own comment) - the unit RealBuildingResolver now resolves per
 // cell, and BuildingHandleCache uploads per cell.
+//
+// collisionMesh (Phase 20) is the real inline CMSH collision geometry
+// (assets::BuildingLayout - see BuildingCell::collisionMesh's own comment)
+// - deliberately kept as plain CPU-side data here, never uploaded to the
+// GPU (unlike `submeshes`), since collision queries run on the CPU every
+// frame. May be empty (zero positions) if the real cell had no CMSH data -
+// callers must treat that as "no collision geometry for this cell" and
+// fall back gracefully, never a hard failure.
 struct ResolvedCell {
     std::vector<ResolvedSubmesh> submeshes;
     std::optional<CellBounds> bounds;
+    assets::MeshData collisionMesh;
+
+    // Real portal data (Phase 20b) - this cell's own portal placements
+    // (assets::BuildingCell::portals) plus a full copy of the building-wide
+    // portalShapes list (assets::BuildingLayoutData::portalShapes,
+    // duplicated per cell rather than plumbed through as a separate
+    // building-level return value - simpler, and negligible cost: at most
+    // a few dozen small polygons per building). See
+    // assets::BuildingCell::portals' own comment for the real format.
+    std::vector<assets::CellPortal> portals;
+    std::vector<assets::PortalShape> portalShapes;
+
+    // Real dedicated floor-collision navmesh (Phase 20c) - see
+    // assets::FloorCollisionMesh's own comment. May be empty (zero
+    // positions) if the real cell had no real floor-collision filename, or
+    // the file failed to load/parse - callers must fall back to
+    // collisionMesh's own raycast query for that cell, never a hard
+    // failure.
+    assets::FloorCollisionMesh floorMesh;
 };
 
 // Transforms a world-space position into ONE specific building instance's
@@ -872,6 +899,43 @@ public:
             ResolvedCell resolvedCell;
             resolvedCell.bounds = computeCellBounds(cellSubmeshResults);
             resolvedCell.submeshes = std::move(cellSubmeshResults);
+            // Real collision-only geometry (Phase 20) - small (position +
+            // index only), a plain copy from the already-parsed layout is
+            // fine; `cell` is a const& into `layout.cells` so it can't be
+            // moved from here.
+            resolvedCell.collisionMesh = cell.collisionMesh;
+            // Real portal data (Phase 20b) - same reasoning as
+            // collisionMesh above (`cell`/`layout` are both const& here).
+            resolvedCell.portals = cell.portals;
+            resolvedCell.portalShapes = layout.portalShapes;
+            // Real dedicated floor-collision navmesh (Phase 20c) - a
+            // SEPARATE real file from the inline CMSH data (see
+            // assets::FloorCollisionMesh's own comment for why this exists
+            // alongside CMSH: it fixes a real switchback-staircase height
+            // ambiguity CMSH's own single-raycast query can't). Graceful
+            // skip on any failure (missing file, unexpected format) -
+            // resolvedCell.floorMesh just stays empty, and callers fall
+            // back to the CMSH raycast for that cell, same "degrade, don't
+            // fail" posture as everywhere else in this pass.
+            if (!cell.floorCollisionFilename.empty()) {
+                auto flrBytes = tryExtract(cell.floorCollisionFilename);
+                if (flrBytes.has_value()) {
+                    try {
+                        resolvedCell.floorMesh = assets::FloorCollision::parse(*flrBytes);
+                        std::cout << "[FLR] cell \"" << cell.name << "\" -> "
+                                   << cell.floorCollisionFilename << " ("
+                                   << resolvedCell.floorMesh.positions.size() << " verts, "
+                                   << resolvedCell.floorMesh.triangleVertexIndices.size() / 3
+                                   << " tris)\n";
+                    } catch (const std::exception& e) {
+                        std::cerr << "[FLR] cell \"" << cell.name << "\" parse failed: " << e.what()
+                                   << "\n";
+                    }
+                } else {
+                    std::cerr << "[FLR] cell \"" << cell.name << "\" file not found: "
+                               << cell.floorCollisionFilename << "\n";
+                }
+            }
             result.push_back(std::move(resolvedCell));
         }
 
@@ -1432,6 +1496,18 @@ private:
 struct CellHandles {
     std::vector<renderer::MeshHandle> submeshes;
     std::optional<CellBounds> bounds;
+    // Real collision-only geometry (Phase 20) - CPU-side only, never
+    // uploaded to the GPU (unlike `submeshes`); may be empty if the real
+    // cell had no CMSH data, in which case collision queries for this cell
+    // must fall back gracefully (see ResolvedCell::collisionMesh's comment).
+    assets::MeshData collisionMesh;
+    // Real portal data (Phase 20b) - see ResolvedCell::portals' own
+    // comment.
+    std::vector<assets::CellPortal> portals;
+    std::vector<assets::PortalShape> portalShapes;
+    // Real dedicated floor-collision navmesh (Phase 20c) - see
+    // ResolvedCell::floorMesh's own comment.
+    assets::FloorCollisionMesh floorMesh;
 };
 
 // A real cell's own mesh geometry doesn't extend out into the shared
@@ -1482,6 +1558,345 @@ std::optional<size_t> findContainingCellIndex(const std::vector<CellHandles>& ce
     return best;
 }
 
+// Phase 20b (portal-based cell transitions) - true if the real segment from
+// `from` to `to` (both already in the shared building-local space every
+// cell's own data lives in) crosses `shape`'s own real portal plane close
+// enough to the polygon's own real extent to count as passing through the
+// actual opening. Uses a bounding-sphere-around-the-centroid approximation
+// of the true polygon rather than a full point-in-polygon test - simpler,
+// and good enough for real door/archway-sized SWG portals (small, roughly
+// convex real openings, never oddly star-shaped or huge). A degenerate
+// shape (fewer than 3 real vertices, or a zero-area first triangle) never
+// blocks a transition - callers must treat that as "this specific portal
+// can't be used to detect a crossing," never a hard failure.
+bool segmentCrossesPortal(const assets::PortalShape& shape, const DirectX::XMFLOAT3& from,
+                           const DirectX::XMFLOAT3& to) {
+    if (shape.vertices.size() < 3) {
+        return false;
+    }
+    DirectX::XMFLOAT3 centroid{0.0f, 0.0f, 0.0f};
+    for (const auto& v : shape.vertices) {
+        centroid.x += v.x;
+        centroid.y += v.y;
+        centroid.z += v.z;
+    }
+    float count = static_cast<float>(shape.vertices.size());
+    centroid.x /= count;
+    centroid.y /= count;
+    centroid.z /= count;
+
+    const auto& v0 = shape.vertices[0];
+    const auto& v1 = shape.vertices[1];
+    const auto& v2 = shape.vertices[2];
+    DirectX::XMFLOAT3 edge1{v1.x - v0.x, v1.y - v0.y, v1.z - v0.z};
+    DirectX::XMFLOAT3 edge2{v2.x - v0.x, v2.y - v0.y, v2.z - v0.z};
+    DirectX::XMFLOAT3 normal{edge1.y * edge2.z - edge1.z * edge2.y,
+                              edge1.z * edge2.x - edge1.x * edge2.z,
+                              edge1.x * edge2.y - edge1.y * edge2.x};
+    float normalLen = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+    if (normalLen < 1e-6f) {
+        return false; // degenerate portal shape
+    }
+    normal.x /= normalLen;
+    normal.y /= normalLen;
+    normal.z /= normalLen;
+
+    auto sideOf = [&](const DirectX::XMFLOAT3& p) {
+        return (p.x - centroid.x) * normal.x + (p.y - centroid.y) * normal.y +
+               (p.z - centroid.z) * normal.z;
+    };
+    float d0 = sideOf(from);
+    float d1 = sideOf(to);
+    if ((d0 > 0.0f) == (d1 > 0.0f)) {
+        return false; // segment doesn't cross this portal's own plane at all
+    }
+
+    float t = d0 / (d0 - d1);
+    DirectX::XMFLOAT3 crossPoint{from.x + t * (to.x - from.x), from.y + t * (to.y - from.y),
+                                  from.z + t * (to.z - from.z)};
+
+    float maxRadius = 0.0f;
+    for (const auto& v : shape.vertices) {
+        float dx = v.x - centroid.x;
+        float dy = v.y - centroid.y;
+        float dz = v.z - centroid.z;
+        maxRadius = std::max(maxRadius, std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    float crossDx = crossPoint.x - centroid.x;
+    float crossDy = crossPoint.y - centroid.y;
+    float crossDz = crossPoint.z - centroid.z;
+    float crossDist = std::sqrt(crossDx * crossDx + crossDy * crossDy + crossDz * crossDz);
+    return crossDist <= maxRadius;
+}
+
+// Phase 20 (collision) - standard Moller-Trumbore ray/triangle intersection.
+// `dir` must be a unit vector; on a hit, `outT` is the real distance from
+// `origin` along `dir` (since `dir` is unit-length, t IS the distance, not
+// just a ray parameter needing further scaling). Used for both the
+// straight-down floor-height query and the horizontal wall-blocking sweep
+// below - same math, different ray direction/purpose.
+bool rayTriangleIntersect(const DirectX::XMFLOAT3& origin, const DirectX::XMFLOAT3& dir,
+                           const assets::Float3& v0, const assets::Float3& v1,
+                           const assets::Float3& v2, float& outT) {
+    constexpr float kEpsilon = 1e-6f;
+    DirectX::XMFLOAT3 edge1{v1.x - v0.x, v1.y - v0.y, v1.z - v0.z};
+    DirectX::XMFLOAT3 edge2{v2.x - v0.x, v2.y - v0.y, v2.z - v0.z};
+    DirectX::XMFLOAT3 h{dir.y * edge2.z - dir.z * edge2.y, dir.z * edge2.x - dir.x * edge2.z,
+                         dir.x * edge2.y - dir.y * edge2.x};
+    float a = edge1.x * h.x + edge1.y * h.y + edge1.z * h.z;
+    if (a > -kEpsilon && a < kEpsilon) {
+        return false; // ray parallel to this triangle
+    }
+    float f = 1.0f / a;
+    DirectX::XMFLOAT3 s{origin.x - v0.x, origin.y - v0.y, origin.z - v0.z};
+    float u = f * (s.x * h.x + s.y * h.y + s.z * h.z);
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+    DirectX::XMFLOAT3 q{s.y * edge1.z - s.z * edge1.y, s.z * edge1.x - s.x * edge1.z,
+                         s.x * edge1.y - s.y * edge1.x};
+    float v = f * (dir.x * q.x + dir.y * q.y + dir.z * q.z);
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+    float t = f * (edge2.x * q.x + edge2.y * q.y + edge2.z * q.z);
+    if (t > kEpsilon) {
+        outT = t;
+        return true;
+    }
+    return false;
+}
+
+// Real floor height (Phase 20c/d) - a proper 2D (X/Z-projected)
+// point-in-triangle query against a cell's own dedicated floor-collision
+// navmesh (see assets::FloorCollisionMesh's own comment). Preferred over
+// the CMSH raycast below wherever real .flr data is available.
+//
+// KNOWN LIMITATION, found live: a real switchback staircase's LOWER flight
+// can share the exact same X/Z footprint as its own UPPER entrance, viewed
+// from directly above - confirmed live, self crossing into a stairwell
+// cell for the first time got matched to the bottom-of-stairs triangle
+// (Y=2.75) instead of the top (Y~9.5), because both real triangles'
+// footprints genuinely overlap in 2D at that specific point. A single
+// "does any triangle contain this point" query can't disambiguate that -
+// it needs real triangle ADJACENCY (assets::FloorCollisionMesh::
+// triangleNeighbors) instead: once on a known-good triangle, only that
+// triangle and its real neighbors are ever considered for the NEXT frame's
+// position, which is a continuity constraint (self can only ever move to a
+// triangle it's truly connected to), not a height heuristic that two
+// unrelated overlapping surfaces could fool.
+struct FloorHit2D {
+    float y = 0.0f;
+    size_t triangleIndex = 0;
+};
+
+// Tests ONE specific real triangle for 2D (X/Z) containment of localPos,
+// returning its real barycentric-interpolated Y if it contains the point.
+std::optional<float> testFloorTriangle2D(const assets::FloorCollisionMesh& mesh,
+                                          size_t triangleIndex,
+                                          const DirectX::XMFLOAT3& localPos) {
+    size_t i = triangleIndex * 3;
+    if (i + 2 >= mesh.triangleVertexIndices.size()) {
+        return std::nullopt;
+    }
+    const auto& v0 = mesh.positions[mesh.triangleVertexIndices[i]];
+    const auto& v1 = mesh.positions[mesh.triangleVertexIndices[i + 1]];
+    const auto& v2 = mesh.positions[mesh.triangleVertexIndices[i + 2]];
+    // Standard 2D barycentric point-in-triangle test.
+    float denom = (v1.z - v2.z) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.z - v2.z);
+    if (std::fabs(denom) < 1e-8f) {
+        return std::nullopt; // degenerate in this X/Z projection
+    }
+    float a = ((v1.z - v2.z) * (localPos.x - v2.x) + (v2.x - v1.x) * (localPos.z - v2.z)) / denom;
+    float b = ((v2.z - v0.z) * (localPos.x - v2.x) + (v0.x - v2.x) * (localPos.z - v2.z)) / denom;
+    float c = 1.0f - a - b;
+    constexpr float kEdgeTolerance = -0.01f; // small slack for real edge-adjacent positions
+    if (a >= kEdgeTolerance && b >= kEdgeTolerance && c >= kEdgeTolerance) {
+        return a * v0.y + b * v1.y + c * v2.y;
+    }
+    return std::nullopt;
+}
+
+// Adjacency-restricted query (the normal, everyday path): tests ONLY
+// `triangleIndex` and its up-to-3 real neighbors - the ambiguity-free way
+// to continue tracking height across ordinary continuous movement. Returns
+// nullopt if self has moved off this local neighborhood entirely (a real
+// room transition or a big jump) - callers fall back to the full-scan
+// version below in that case.
+std::optional<FloorHit2D> queryFloorHeight2DAdjacent(const assets::FloorCollisionMesh& mesh,
+                                                      size_t triangleIndex,
+                                                      const DirectX::XMFLOAT3& localPos) {
+    if (auto y = testFloorTriangle2D(mesh, triangleIndex, localPos)) {
+        return FloorHit2D{*y, triangleIndex};
+    }
+    size_t neighborBase = triangleIndex * 3;
+    if (neighborBase + 2 < mesh.triangleNeighbors.size()) {
+        for (int k = 0; k < 3; ++k) {
+            int32_t neighbor = mesh.triangleNeighbors[neighborBase + k];
+            if (neighbor < 0) {
+                continue;
+            }
+            size_t neighborIdx = static_cast<size_t>(neighbor);
+            if (auto y = testFloorTriangle2D(mesh, neighborIdx, localPos)) {
+                return FloorHit2D{*y, neighborIdx};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// Full-mesh scan (only for a fresh cell entry or a big jump, where no
+// current-triangle context exists yet): among ALL real triangles whose 2D
+// footprint contains localPos.x/z, picks whichever's real Y is CLOSEST to
+// `referenceY` - the caller's own last known-good height (e.g. self's Y in
+// the PREVIOUS cell, right at the moment of a portal crossing), which
+// correctly disambiguates the real switchback case (the upper entrance,
+// near referenceY, over the unrelated lower flight far below it).
+std::optional<FloorHit2D> queryFloorHeight2DFullScan(const assets::FloorCollisionMesh& mesh,
+                                                      const DirectX::XMFLOAT3& localPos,
+                                                      float referenceY) {
+    std::optional<FloorHit2D> best;
+    float bestDelta = 0.0f;
+    size_t triCount = mesh.triangleVertexIndices.size() / 3;
+    for (size_t t = 0; t < triCount; ++t) {
+        auto y = testFloorTriangle2D(mesh, t, localPos);
+        if (!y.has_value()) {
+            continue;
+        }
+        float delta = std::fabs(*y - referenceY);
+        if (!best.has_value() || delta < bestDelta) {
+            best = FloorHit2D{*y, t};
+            bestDelta = delta;
+        }
+    }
+    return best;
+}
+
+// Real floor height (Phase 20) - casts a ray straight down through the real
+// collision mesh (see BuildingCell::collisionMesh's own comment) from well
+// above `localPos`, returning the highest real surface hit below it, or
+// nullopt if the mesh is empty/nothing is hit (a real gap between cell
+// vertical bounds and where self happens to be, or a cell with no real
+// collision data at all) - callers must fall back gracefully in that case,
+// never treat it as an error.
+//
+// KNOWN LIMITATION, found live (Phase 20b): a real switchback staircase
+// (two flights stacked over one another within the same cell) breaks
+// "highest hit wins" - once self is on the LOWER flight, this ray still
+// passes through the UPPER flight/landing directly overhead first, so
+// height snaps back to the upper landing instead of continuing down. A
+// "closest to self's current height" alternative was tried live and made
+// things WORSE (got stuck re-selecting the same wrong surface every frame
+// instead of ever finding the true descending path) - reverted. Real fix
+// needs something smarter than a single vertical ray (e.g. also checking
+// horizontal proximity/reachability from self's last known-good position,
+// not just nearest-by-Y) - not yet implemented, tracked as a known gap.
+std::optional<float> queryFloorHeight(const assets::MeshData& collisionMesh,
+                                       const DirectX::XMFLOAT3& localPos) {
+    if (collisionMesh.positions.empty()) {
+        return std::nullopt;
+    }
+    constexpr float kRayStartAbove = 50.0f; // world units - comfortably above any real room height
+    DirectX::XMFLOAT3 origin{localPos.x, localPos.y + kRayStartAbove, localPos.z};
+    DirectX::XMFLOAT3 down{0.0f, -1.0f, 0.0f};
+    std::optional<float> bestT;
+    for (size_t i = 0; i + 2 < collisionMesh.indices.size(); i += 3) {
+        const auto& v0 = collisionMesh.positions[collisionMesh.indices[i]];
+        const auto& v1 = collisionMesh.positions[collisionMesh.indices[i + 1]];
+        const auto& v2 = collisionMesh.positions[collisionMesh.indices[i + 2]];
+        float t = 0.0f;
+        if (rayTriangleIntersect(origin, down, v0, v1, v2, t)) {
+            if (!bestT.has_value() || t < *bestT) {
+                bestT = t;
+            }
+        }
+    }
+    if (!bestT.has_value()) {
+        return std::nullopt;
+    }
+    return origin.y - *bestT;
+}
+
+// Real horizontal wall blocking (Phase 20) - true if the straight segment
+// from `from` to `to` (both in the same cell's own local space) crosses any
+// real triangle of `collisionMesh`. Callers should test at a height above
+// the real floor (see kWallTestHeightMeters below) rather than at foot
+// level, so a real floor triangle - which the segment would otherwise
+// nearly graze along, numerically unstable - is never mistaken for a wall.
+bool segmentBlockedByCollisionMesh(const assets::MeshData& collisionMesh,
+                                    const DirectX::XMFLOAT3& from, const DirectX::XMFLOAT3& to) {
+    if (collisionMesh.positions.empty()) {
+        return false;
+    }
+    DirectX::XMFLOAT3 delta{to.x - from.x, to.y - from.y, to.z - from.z};
+    float length = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    if (length < 1e-5f) {
+        return false;
+    }
+    DirectX::XMFLOAT3 dir{delta.x / length, delta.y / length, delta.z / length};
+    for (size_t i = 0; i + 2 < collisionMesh.indices.size(); i += 3) {
+        const auto& v0 = collisionMesh.positions[collisionMesh.indices[i]];
+        const auto& v1 = collisionMesh.positions[collisionMesh.indices[i + 1]];
+        const auto& v2 = collisionMesh.positions[collisionMesh.indices[i + 2]];
+        float t = 0.0f;
+        if (rayTriangleIntersect(from, dir, v0, v1, v2, t) && t < length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Waist-to-chest height above the real floor, used to test horizontal
+// movement against real wall geometry without the test segment nearly
+// grazing along the floor mesh itself (see segmentBlockedByCollisionMesh's
+// own comment).
+constexpr float kWallTestHeightMeters = 1.0f;
+
+// Phase 20, Step 4 - a small, explicitly hand-maintained list of real
+// individually-collidable objects that are NOT structural (no BuildingLayout
+// cell/CMSH data applies to them - they're ordinary tangible objects) but
+// were confirmed live on Finalizer to block movement anyway. Starts with
+// exactly the bazaar and bank terminals, both confirmed live. Deliberately
+// NOT derived from Core3's own per-template collision flags (confirmed via
+// direct byte dump this session: unset/zero for both of these exact
+// objects) or from Core3's exact hardcoded per-class server mechanism
+// (CloseObjectsVector::COLLIDABLETYPE, not fully traced) - see the plan's
+// own Context for the full reasoning. Extend this list opportunistically as
+// more real examples turn up through play-testing; no re-derivation needed.
+const std::unordered_set<uint32_t>& curatedCollidableObjectCrcs() {
+    static const std::unordered_set<uint32_t> crcs = {
+        soe::MessageHash::compute("object/tangible/terminal/shared_terminal_bazaar.iff"),
+        soe::MessageHash::compute("object/tangible/terminal/shared_terminal_bank.iff"),
+    };
+    return crcs;
+}
+
+// Curated objects have no real per-cell collision mesh to raycast against
+// (they're not building geometry) - approximated instead as a simple
+// horizontal blocking circle around the object's own real world position (a
+// plain point-to-segment distance test in the X/Z plane, ignoring height,
+// since these are all fixed floor-standing objects). Same "coarse but
+// graceful" spirit as the rest of this pass, not a precise hull.
+constexpr float kCuratedObjectBlockRadiusMeters = 0.75f;
+
+bool segmentBlockedByCuratedObject(const DirectX::XMFLOAT3& objPos, const DirectX::XMFLOAT3& from,
+                                    const DirectX::XMFLOAT3& to) {
+    float dx = to.x - from.x;
+    float dz = to.z - from.z;
+    float lengthSq = dx * dx + dz * dz;
+    float t = 0.0f;
+    if (lengthSq > 1e-8f) {
+        t = ((objPos.x - from.x) * dx + (objPos.z - from.z) * dz) / lengthSq;
+        t = std::clamp(t, 0.0f, 1.0f);
+    }
+    float closestX = from.x + dx * t;
+    float closestZ = from.z + dz * t;
+    float distX = objPos.x - closestX;
+    float distZ = objPos.z - closestZ;
+    return (distX * distX + distZ * distZ) <=
+           (kCuratedObjectBlockRadiusMeters * kCuratedObjectBlockRadiusMeters);
+}
+
 // Phase 16 - same shape/contract as SkeletalMeshHandleCache above, for real
 // building geometry, one level deeper (Phase 19): each cached entry is a
 // list of CellHandles, one per real cell, index-aligned with the .pob's own
@@ -1517,6 +1932,10 @@ public:
                 for (const auto& resolvedCell : *ready->cellMeshData) {
                     CellHandles cellHandles;
                     cellHandles.bounds = resolvedCell.bounds;
+                    cellHandles.collisionMesh = resolvedCell.collisionMesh;
+                    cellHandles.portals = resolvedCell.portals;
+                    cellHandles.portalShapes = resolvedCell.portalShapes;
+                    cellHandles.floorMesh = resolvedCell.floorMesh;
                     cellHandles.submeshes.reserve(resolvedCell.submeshes.size());
                     for (const auto& resolved : resolvedCell.submeshes) {
                         cellHandles.submeshes.push_back(uploadResolvedSubmesh(gfx, resolved));
@@ -1780,6 +2199,35 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     // meaning.
     uint64_t predictedSelfParentId = 0;
 
+    // Phase 20b (portal-based cell transitions) - which real cell self is
+    // currently believed to be standing in, persisted across frames rather
+    // than re-derived from scratch every frame via the old coarse AABB
+    // test. Only ever CHANGES when self's own movement segment actually
+    // crosses one of the current cell's real portal shapes into the
+    // connected adjacent cell (see segmentCrossesPortal()'s own comment) -
+    // a real, precise transition signal instead of an approximate
+    // bounding-box re-test, which was the root cause of the live-caught
+    // boundary flakiness (sinking, "hard edge" snaps, stairs never
+    // registering) the AABB-only approach kept hitting right at cell
+    // edges. Reset to nullopt (forcing a fresh one-time AABB-based guess)
+    // whenever self wasn't inside ANY building footprint last frame, or
+    // the building itself changed - see wasInsideBuildingFootprintLastFrame's
+    // own comment.
+    std::optional<size_t> persistentCellIndex;
+    uint64_t persistentCellBuildingId = 0;
+    bool wasInsideBuildingFootprintLastFrame = false;
+
+    // Phase 20d - which real triangle of the CURRENT cell's own .flr
+    // navmesh self is standing on, persisted across frames for the
+    // adjacency-restricted query (see queryFloorHeight2DAdjacent's own
+    // comment - this is what actually fixes the real switchback-staircase
+    // ambiguity). Keyed by cell index (not building id - persistentCellIndex
+    // already handles the building-level reset); reset to nullopt whenever
+    // the resolved cell for floor-height purposes changes, forcing a fresh
+    // full-mesh scan (see queryFloorHeight2DFullScan) to re-seed it.
+    std::optional<size_t> persistentFloorTriangleIndex;
+    std::optional<size_t> persistentFloorTriangleCellIndex;
+
     // Phase 17 Step 5 - edge-detects a fresh left-click (down this frame,
     // wasn't down last frame) rather than firing once per frame the button
     // is held, since Window only exposes level-triggered isMouseButtonDown().
@@ -1946,6 +2394,11 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                 movementKeyHeld = true;
             }
 
+            // Real collision (Phase 20) needs both the pre-move and
+            // candidate post-move world position - captured here, before
+            // the WASD delta below mutates predictedSelfPos.x/z in place.
+            DirectX::XMFLOAT3 preMovePos = predictedSelfPos;
+
             float currentSpeed = 0.0f;
             if (movementKeyHeld) {
                 moveVec = DirectX::XMVector3Normalize(moveVec);
@@ -1962,27 +2415,61 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                 currentSpeed = kWalkSpeedMetersPerSecond;
             }
 
-            // Phase 19 fix - "am I inside a building's footprint at all"
-            // has to be determined locally now too, same reasoning as the
-            // room-detection fix above: predictedSelfParentId only updates
-            // right at zone-in or after a genuine server-driven relocation
-            // (an elevator ride), never during ordinary walking - so
-            // walking OUT of a building kept it stuck at its last real
-            // indoor value, which kept choosing indoor Y (frozen at
-            // whatever height self last had indoors) instead of falling
-            // back to real terrain height, leaving self visibly floating
-            // above the ground once outside. Tested against every visible
-            // building's own cell 0 (the exterior shell - its real bounds
-            // span the whole building's footprint) rather than any one
-            // specific building instance, same "don't assume, just test
-            // what's actually there" approach as findContainingCellIndex.
-            // Deliberately only decides OUTDOOR-vs-INDOOR here, not which
-            // specific room (that's still the separate, already-fixed
-            // per-building cellIndex lookup in the draw loop) - and
-            // deliberately does NOT touch predictedSelfParentId itself,
-            // which the outbound-movement/anti-cheat code below still
-            // depends on and hasn't been re-verified against this session.
+            // Phase 19 fix, extended by Phase 20 (real collision) - "am I
+            // inside a building's footprint," "which specific real cell,"
+            // real wall blocking, and real floor height are all determined
+            // locally now, same reasoning throughout: predictedSelfParentId
+            // only updates right at zone-in or after a genuine server-driven
+            // relocation (an elevator ride), never during ordinary walking,
+            // so anything waiting on a fresh server report goes stale - see
+            // project_server_position_echo_gap.md. Deliberately does NOT
+            // touch predictedSelfParentId itself, which the outbound-
+            // movement/anti-cheat code below still depends on.
+            //
+            // The specific cell is looked up using the PRE-move position
+            // (self was validly there a moment ago, guaranteed), not the
+            // just-computed candidate - a real wall-clip attempt can put
+            // the candidate position on the far side of a wall, outside
+            // every cell's own bounds, which would otherwise make "which
+            // cell's collision mesh applies" ambiguous right when it
+            // matters most.
             bool selfInsideAnyBuildingFootprint = false;
+            bool movementBlockedByWall = false;
+            // Real bugfix, found live: queryFloorHeight() returns a height
+            // in the BUILDING-LOCAL frame (it raycasts against the
+            // collision mesh's own local vertices, same space as oldLocal/
+            // newLocal) - it must be converted back to WORLD space (+
+            // buildingCandidate.y, captured here as buildingWorldY) before
+            // ever being written to predictedSelfPos.y, which is always
+            // world space. Missing that conversion was the real root cause
+            // of the live-observed stuttering/oscillation and "walks
+            // through stairs" behavior: a real local floor hit (e.g. 9.5)
+            // was being written directly into predictedSelfPos.y as if it
+            // were already a world Y, teleporting self to a wildly wrong
+            // world height every time a floor hit was found. That wrong
+            // world Y then failed the NEXT frame's containment test
+            // (worldToBuildingLocal correctly subtracts building.y, so the
+            // now-wrong world Y produced local coordinates outside every
+            // real cell's bounds), falling back to the stale spawn-time
+            // lastKnownSelfPos.y, re-entering the room, computing the same
+            // local floor height again, and repeating forever.
+            std::optional<float> newFloorHeight;
+            float buildingWorldY = 0.0f;
+            // TEMPORARY diagnostic (Phase 20 debugging) - captured inside the
+            // forEach below, printed (throttled) after it, to see live which
+            // cell is actually being selected and what the raw wall/floor
+            // test results are while walking near a wall or up the stairs.
+            // Remove once the real remaining wall/stairs bugs are found.
+            std::optional<size_t> debugCellIndex;
+            DirectX::XMFLOAT3 debugOldLocal{};
+            bool debugBlockedByInteriorCell = false;
+            bool debugBlockedByShell = false;
+            bool debugUsedFlrNavmesh = false;
+            size_t debugCellMeshTriCount = 0;
+            float debugCellMeshYMin = 0.0f;
+            float debugCellMeshYMax = 0.0f;
+            uint64_t debugBuildingObjectId = 0;
+            DirectX::XMFLOAT3 debugBuildingWorldPos{};
             objectStore.forEach([&](const auto& buildingCandidate) {
                 using T = std::decay_t<decltype(buildingCandidate)>;
                 if constexpr (std::is_same_v<T, worldmodel::CellObject> ||
@@ -1999,46 +2486,329 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                         return;
                     }
                     const auto& b = *(*cells)[0].bounds;
-                    DirectX::XMFLOAT3 selfLocal =
+                    DirectX::XMFLOAT3 oldLocal = worldToBuildingLocal(preMovePos, buildingCandidate);
+                    if (oldLocal.x < b.min.x - kCellBoundsMarginMeters ||
+                        oldLocal.x > b.max.x + kCellBoundsMarginMeters ||
+                        oldLocal.y < b.min.y - kCellBoundsMarginMeters ||
+                        oldLocal.y > b.max.y + kCellBoundsMarginMeters ||
+                        oldLocal.z < b.min.z - kCellBoundsMarginMeters ||
+                        oldLocal.z > b.max.z + kCellBoundsMarginMeters) {
+                        return;
+                    }
+                    selfInsideAnyBuildingFootprint = true;
+                    buildingWorldY = buildingCandidate.y;
+                    debugBuildingObjectId = buildingCandidate.objectId;
+                    debugBuildingWorldPos = DirectX::XMFLOAT3{buildingCandidate.x, buildingCandidate.y,
+                                                               buildingCandidate.z};
+
+                    DirectX::XMFLOAT3 newLocal =
                         worldToBuildingLocal(predictedSelfPos, buildingCandidate);
-                    if (selfLocal.x >= b.min.x - kCellBoundsMarginMeters &&
-                        selfLocal.x <= b.max.x + kCellBoundsMarginMeters &&
-                        selfLocal.y >= b.min.y - kCellBoundsMarginMeters &&
-                        selfLocal.y <= b.max.y + kCellBoundsMarginMeters &&
-                        selfLocal.z >= b.min.z - kCellBoundsMarginMeters &&
-                        selfLocal.z <= b.max.z + kCellBoundsMarginMeters) {
-                        selfInsideAnyBuildingFootprint = true;
+                    DirectX::XMFLOAT3 wallTestFrom{oldLocal.x, oldLocal.y + kWallTestHeightMeters,
+                                                    oldLocal.z};
+                    DirectX::XMFLOAT3 wallTestTo{newLocal.x, newLocal.y + kWallTestHeightMeters,
+                                                  newLocal.z};
+
+                    // Real bugfix, found live (Phase 20b): the old AABB-only
+                    // findContainingCellIndex() was re-run from scratch every
+                    // single frame, and cell boundaries are exactly where its
+                    // padded-bounding-box approximation is weakest (real
+                    // rooms are rarely axis-aligned boxes; a stairwell is a
+                    // continuous ramp, not a box at all) - confirmed live as
+                    // the root cause of recurring boundary flakiness
+                    // (sinking on approach, "hard edge" snaps, stairs never
+                    // registering height changes). Real per-cell portal data
+                    // (see assets::BuildingCell::portals' own comment) gives
+                    // an exact, precise transition signal instead: which
+                    // cell self is in is now PERSISTENT state
+                    // (persistentCellIndex, reset only on a genuine fresh
+                    // entry - see its own comment), only ever changing when
+                    // self's own movement segment actually crosses one of
+                    // the CURRENT cell's real portal shapes into the
+                    // connected adjacent cell. The AABB test still runs, but
+                    // only once, as the one-time initial guess for a fresh
+                    // entry - never as the ongoing per-frame source of
+                    // truth.
+                    if (!wasInsideBuildingFootprintLastFrame ||
+                        persistentCellBuildingId != buildingCandidate.objectId) {
+                        persistentCellIndex.reset();
+                        persistentCellBuildingId = buildingCandidate.objectId;
+                    }
+                    if (!persistentCellIndex.has_value()) {
+                        persistentCellIndex = findContainingCellIndex(*cells, oldLocal);
+                        if (!persistentCellIndex.has_value()) {
+                            // Real bugfix, found live: standing on the
+                            // building's own ROOF (real geometry that's part
+                            // of cell 0/the exterior shell, not any interior
+                            // room) has no interior cell whose bounds
+                            // contain it - findContainingCellIndex()
+                            // deliberately excludes cell 0 itself (correct
+                            // for its OTHER caller, room-highlight rendering
+                            // - see its own comment), so this always
+                            // returned nullopt there. For seeding the
+                            // PERSISTENT cell specifically, cell 0 is a
+                            // legitimate starting point in its own right -
+                            // it has real CMSH floor geometry AND its own
+                            // real portal list (confirmed live: without
+                            // this fallback, self on the real roof got
+                            // seeded into a wrong, unrelated interior room
+                            // via the same footprint-AABB match used
+                            // elsewhere, then got permanently stuck there
+                            // since that wrong room had no real portal path
+                            // back to where self actually was).
+                            persistentCellIndex = 0;
+                        }
+                    }
+                    if (persistentCellIndex.has_value() && *persistentCellIndex < cells->size()) {
+                        const CellHandles& currentCell = (*cells)[*persistentCellIndex];
+                        for (const auto& portalRef : currentCell.portals) {
+                            if (portalRef.portalShapeIndex >= currentCell.portalShapes.size() ||
+                                portalRef.adjacentCellIndex >= cells->size()) {
+                                continue;
+                            }
+                            const auto& shape = currentCell.portalShapes[portalRef.portalShapeIndex];
+                            if (segmentCrossesPortal(shape, oldLocal, newLocal)) {
+                                persistentCellIndex = portalRef.adjacentCellIndex;
+                                break;
+                            }
+                        }
+                    }
+                    auto cellIndex = persistentCellIndex;
+                    bool blocked = false;
+                    if (cellIndex.has_value()) {
+                        const CellHandles& cell = (*cells)[*cellIndex];
+                        if (!cell.collisionMesh.positions.empty() &&
+                            segmentBlockedByCollisionMesh(cell.collisionMesh, wallTestFrom,
+                                                           wallTestTo)) {
+                            blocked = true;
+                            debugBlockedByInteriorCell = true;
+                        }
+                    }
+                    debugCellIndex = cellIndex;
+                    debugOldLocal = oldLocal;
+
+                    // Real bugfix, found live: cell 0 (the exterior shell)
+                    // carries the true outer-wall geometry - an interior
+                    // room's own CMSH only covers its own internal
+                    // partitions, never the true perimeter wall, so the one
+                    // frame self's movement actually crossed that wall was
+                    // going untested (using only the interior room's own
+                    // mesh, which has no triangle there), letting self
+                    // tunnel straight through. Checked unconditionally, not
+                    // only when no interior cell matches, so the crossing
+                    // frame itself is always caught rather than one frame
+                    // late. Deliberately NEVER used for floor height below
+                    // (see that comment) - blocking doesn't write to Y, so
+                    // this can't cause the height-lock feedback bug height
+                    // queries did.
+                    const CellHandles& shell = (*cells)[0];
+                    if (!shell.collisionMesh.positions.empty() &&
+                        segmentBlockedByCollisionMesh(shell.collisionMesh, wallTestFrom,
+                                                       wallTestTo)) {
+                        blocked = true;
+                        debugBlockedByShell = true;
+                    }
+
+                    if (blocked) {
+                        movementBlockedByWall = true;
+                    }
+
+                    // Floor height: the matched interior room's own CMSH
+                    // takes priority (more precise per-room data), falling
+                    // back to cell 0's (the exterior shell's) own CMSH when
+                    // no interior room matched or its own mesh gave no hit -
+                    // real entry ramps/stairs/porches leading up to the
+                    // building's own front door live in the shell's mesh,
+                    // not any interior room's. Re-enabled tonight: this was
+                    // disabled entirely after last night's "permanent height
+                    // lock" bug, but that bug's real root cause (confirmed
+                    // and fixed above) was the missing local-to-world Y
+                    // conversion, not cell 0's data itself - once a real
+                    // floor hit is correctly converted back to world space,
+                    // it can no longer feed a wrong value into next frame's
+                    // containment test the way the old bug did.
+                    DirectX::XMFLOAT3 floorQueryPos = blocked ? oldLocal : newLocal;
+                    // Real fix (Phase 20c/d): the dedicated .flr navmesh's
+                    // own 2D point-in-triangle query is tried FIRST - it
+                    // can't confuse two vertically-stacked surfaces the way
+                    // the CMSH raycast can. Adjacency-restricted
+                    // (queryFloorHeight2DAdjacent) whenever a persistent
+                    // triangle is already known for THIS source cell -
+                    // that's the ambiguity-free everyday path. Only falls
+                    // back to a full-mesh scan (queryFloorHeight2DFullScan,
+                    // referenced against floorQueryPos.y - self's own
+                    // last-known height, which correctly disambiguates a
+                    // real switchback's upper entrance from its unrelated
+                    // lower flight) on a fresh cell entry, then to the CMSH
+                    // raycast if this cell has no real .flr data at all.
+                    auto tryFloorHeight = [&](const CellHandles& source, size_t sourceCellIndex) {
+                        if (!source.floorMesh.positions.empty()) {
+                            std::optional<FloorHit2D> hit2D;
+                            if (persistentFloorTriangleIndex.has_value() &&
+                                persistentFloorTriangleCellIndex.has_value() &&
+                                *persistentFloorTriangleCellIndex == sourceCellIndex) {
+                                hit2D = queryFloorHeight2DAdjacent(
+                                    source.floorMesh, *persistentFloorTriangleIndex, floorQueryPos);
+                            }
+                            if (!hit2D.has_value()) {
+                                hit2D = queryFloorHeight2DFullScan(source.floorMesh, floorQueryPos,
+                                                                    floorQueryPos.y);
+                            }
+                            if (hit2D.has_value()) {
+                                newFloorHeight = hit2D->y;
+                                persistentFloorTriangleIndex = hit2D->triangleIndex;
+                                persistentFloorTriangleCellIndex = sourceCellIndex;
+                                debugUsedFlrNavmesh = true;
+                                debugCellMeshTriCount = source.floorMesh.triangleVertexIndices.size() / 3;
+                                debugCellMeshYMin = source.floorMesh.positions[0].y;
+                                debugCellMeshYMax = source.floorMesh.positions[0].y;
+                                for (const auto& p : source.floorMesh.positions) {
+                                    debugCellMeshYMin = std::min(debugCellMeshYMin, p.y);
+                                    debugCellMeshYMax = std::max(debugCellMeshYMax, p.y);
+                                }
+                                return;
+                            }
+                        }
+                        if (source.collisionMesh.positions.empty()) {
+                            return;
+                        }
+                        auto hit = queryFloorHeight(source.collisionMesh, floorQueryPos);
+                        if (!hit.has_value()) {
+                            return;
+                        }
+                        newFloorHeight = hit;
+                        // TEMPORARY diagnostic (Phase 20 debugging) - the
+                        // real Y range/triangle count of whichever mesh
+                        // actually produced the hit, to tell a genuinely
+                        // flat real collision floor apart from a raycast
+                        // bug hitting the same triangle repeatedly.
+                        debugCellMeshTriCount = source.collisionMesh.indices.size() / 3;
+                        debugCellMeshYMin = source.collisionMesh.positions[0].y;
+                        debugCellMeshYMax = source.collisionMesh.positions[0].y;
+                        for (const auto& p : source.collisionMesh.positions) {
+                            debugCellMeshYMin = std::min(debugCellMeshYMin, p.y);
+                            debugCellMeshYMax = std::max(debugCellMeshYMax, p.y);
+                        }
+                    };
+                    if (cellIndex.has_value()) {
+                        tryFloorHeight((*cells)[*cellIndex], *cellIndex);
+                    }
+                    if (!newFloorHeight.has_value()) {
+                        tryFloorHeight(shell, 0);
                     }
                 }
             });
 
-            // Ground-clamp to real terrain height (already live-verified
-            // this session) - the server independently recomputes its own
-            // authoritative height via collision regardless (confirmed from
-            // Core3's DataTransformCallback::updatePosition() source), so
-            // this is for correct LOCAL rendering, not something the server
-            // strictly depends on us getting right.
-            if (terrainSource && !selfInsideAnyBuildingFootprint) {
+            // Phase 20b - captures THIS frame's final footprint state for
+            // next frame's persistent-cell reset check (see
+            // persistentCellIndex's own comment) - must run after the
+            // forEach above, once selfInsideAnyBuildingFootprint is settled
+            // for the frame.
+            wasInsideBuildingFootprintLastFrame = selfInsideAnyBuildingFootprint;
+
+            // Phase 20, Step 4 - the small curated non-structural object
+            // list (bazaar/bank terminals). Only checked if the wall pass
+            // above didn't already block this move - no need to resolve
+            // curated-object positions on an already-rejected move. Uses
+            // the same worldSnapshot taken once per frame, per
+            // resolveWorldPosition()'s own calling convention.
+            if (!movementBlockedByWall) {
+                const auto& curatedCrcs = curatedCollidableObjectCrcs();
+                objectStore.forEach([&](const auto& candidate) {
+                    using T = std::decay_t<decltype(candidate)>;
+                    if constexpr (std::is_same_v<T, worldmodel::CellObject> ||
+                                  std::is_same_v<T, worldmodel::GroupObject>) {
+                        return;
+                    } else {
+                        if (movementBlockedByWall || candidate.isSelf ||
+                            curatedCrcs.find(candidate.objectCrc) == curatedCrcs.end()) {
+                            return;
+                        }
+                        auto objPos = resolveWorldPosition(worldSnapshot, candidate);
+                        if (!objPos.has_value()) {
+                            return; // graceful fallback - unresolved position, can't test it
+                        }
+                        if (segmentBlockedByCuratedObject(*objPos, preMovePos, predictedSelfPos)) {
+                            movementBlockedByWall = true;
+                        }
+                    }
+                });
+            }
+
+            if (movementBlockedByWall) {
+                predictedSelfPos.x = preMovePos.x;
+                predictedSelfPos.z = preMovePos.z;
+            }
+
+            // Real bugfix, found live (round 2): making terrain the
+            // universal fallback (see the previous version of this comment)
+            // fixed the outdoor-approach clipping, but overcorrected -
+            // self standing on an upper floor (e.g. the 3rd story) hits a
+            // brief real gap in floor-mesh coverage (crossing between
+            // rooms, approaching a stairwell) and got snapped all the way
+            // down to GROUND-LEVEL outdoor terrain, confirmed live: "gets
+            // to the edge of the cell and then snaps back to the terrain."
+            // Terrain is only a sane fallback when genuinely OUTSIDE the
+            // building's footprint - indoors, holding the current height
+            // unchanged for that one gap frame is far safer than guessing
+            // via terrain, which knows nothing about which real floor
+            // self is actually standing on. This is now safe to do (it
+            // wasn't, the first time this project tried it last night)
+            // because two things changed since: the local-to-world Y
+            // conversion bug is fixed, and cell 0's own CMSH (real entry
+            // ramps/porches) is back in the floor-height search, so the
+            // genuinely-outdoors-approaching-the-building case is now
+            // usually covered by a real floor hit before ever reaching
+            // this fallback at all.
+            if (newFloorHeight.has_value()) {
+                // Real floor height (Phase 20) - continuously follows the
+                // real per-cell collision mesh (real stairs/ramps included),
+                // replacing the old frozen-at-last-server-report behavior.
+                // newFloorHeight is in the BUILDING-LOCAL frame (see
+                // buildingWorldY's own comment above) - convert back to
+                // world space before writing to predictedSelfPos.y.
+                predictedSelfPos.y = buildingWorldY + *newFloorHeight;
+            } else if (terrainSource && !selfInsideAnyBuildingFootprint) {
                 predictedSelfPos.y =
                     terrainSource->queryHeight(predictedSelfPos.x, predictedSelfPos.z);
-            } else if (selfInsideAnyBuildingFootprint) {
-                // Indoors: re-sync every frame from the server's own latest
-                // resolved position (lastKnownSelfPos, computed fresh each
-                // frame above via resolveWorldPosition), not just once on a
-                // parentId change. Two real bugs this fixes, found live:
-                // (1) a race where the containing building's own position
-                // hadn't arrived yet at the exact moment self's parentId
-                // changed, permanently freezing Y at resolveWorldPosition's
-                // raw-local-coordinate fallback with no way to self-correct
-                // once the building's real data DID arrive a moment later;
-                // (2) a real elevator ride keeps the SAME parentId the whole
-                // time (only the LOCAL y changes, per a real Phase 17
-                // capture) - a change-triggered-only snap would never
-                // notice the ride happening at all. X/Z stay purely
-                // WASD-predicted (not overwritten here) so normal indoor
-                // walking doesn't fight the server's own less-frequent
-                // idle-sync reports.
-                predictedSelfPos.y = lastKnownSelfPos.y;
+            }
+            // else: hold predictedSelfPos.y unchanged - the graceful
+            // fallback for a real gap in floor-mesh coverage while
+            // genuinely indoors (see comment above).
+
+            // TEMPORARY diagnostic print (Phase 20 debugging), throttled to
+            // ~4/sec so it's readable while walking around live. Placed
+            // AFTER the height-resolution chain above (unlike an earlier
+            // version of this same print) so predictedY reflects THIS
+            // frame's real final value, not last frame's stale one.
+            {
+                static Clock::time_point lastDebugPrint;
+                if (selfInsideAnyBuildingFootprint &&
+                    std::chrono::duration<float>(now - lastDebugPrint).count() > 0.25f) {
+                    lastDebugPrint = now;
+                    std::cout << "[COLLISION DEBUG] cell="
+                              << (debugCellIndex.has_value() ? std::to_string(*debugCellIndex)
+                                                              : std::string("NONE"))
+                              << " local=(" << debugOldLocal.x << "," << debugOldLocal.y << ","
+                              << debugOldLocal.z << ")"
+                              << " blockedInterior=" << debugBlockedByInteriorCell
+                              << " blockedShell=" << debugBlockedByShell
+                              << " floorHeight="
+                              << (newFloorHeight.has_value() ? std::to_string(*newFloorHeight)
+                                                              : std::string("NONE"))
+                              << " predictedY=" << predictedSelfPos.y
+                              << " usedFlrNavmesh=" << debugUsedFlrNavmesh
+                              << " cellMeshTris=" << debugCellMeshTriCount
+                              << " cellMeshYRange=(" << debugCellMeshYMin << ".."
+                              << debugCellMeshYMax << ")"
+                              << " buildingId=" << debugBuildingObjectId << " buildingPos=("
+                              << debugBuildingWorldPos.x << "," << debugBuildingWorldPos.y << ","
+                              << debugBuildingWorldPos.z << ")"
+                              << " outdoorTerrainY="
+                              << (terrainSource ? std::to_string(terrainSource->queryHeight(
+                                                       predictedSelfPos.x, predictedSelfPos.z))
+                                                 : std::string("N/A"))
+                              << "\n";
+                }
             }
 
             // Outbound movement report - real client cadence (MID_DELTA=

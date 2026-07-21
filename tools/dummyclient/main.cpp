@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -16,6 +17,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "assets/IffReader.h"
+#include "assets/TreArchive.h"
 #include "clientcommon/HexDump.h"
 #include "clientcommon/ObjControllerHandlers.h"
 #include "soe/MessageDispatcher.h"
@@ -960,6 +963,12 @@ struct CliOptions {
     // Defaults to this project's own dev machine's real install path;
     // override with --client-path on any other machine.
     std::string clientPath = "C:\\Program Files (x86)\\StarWarsGalaxies";
+
+    // TEMPORARY diagnostic (Phase 20 portal research) - dumps the real IFF
+    // chunk tree of a .pob file (path relative to data_other_00.tre, e.g.
+    // "appearance/ply_all_assoc_hall_civ_s01.pob") and exits, no networking.
+    // Remove once real portal geometry parsing is implemented/verified.
+    std::string dumpPobPath;
 };
 
 CliOptions parseCommandLine(int argc, char** argv) {
@@ -993,9 +1002,65 @@ CliOptions parseCommandLine(int argc, char** argv) {
         else if (arg == "--capture-objcontroller") opts.captureObjController = true;
         else if (arg == "--visualize") opts.visualize = true;
         else if (arg == "--client-path") opts.clientPath = next("--client-path");
+        else if (arg == "--dump-pob") opts.dumpPobPath = next("--dump-pob");
     }
 
     return opts;
+}
+
+// TEMPORARY diagnostic (Phase 20 portal research) - prints the real IFF
+// chunk tree (tag, formType if a FORM, byte size, nesting depth) rooted at
+// `chunk`, and for any leaf chunk whose tag is "PRTL" or a FORM whose
+// formType is "PRTL", also hex-dumps its raw payload bytes so the real
+// portal-placement geometry format can be reverse-engineered by hand, the
+// same way this project's real CMSH/floor-collision format was discovered
+// earlier this session. Remove once real portal parsing lands.
+void dumpIffTree(const assets::IffChunk& chunk, int depth) {
+    auto tagToString = [](uint32_t tag) {
+        std::string s(4, ' ');
+        s[0] = static_cast<char>((tag >> 24) & 0xFF);
+        s[1] = static_cast<char>((tag >> 16) & 0xFF);
+        s[2] = static_cast<char>((tag >> 8) & 0xFF);
+        s[3] = static_cast<char>(tag & 0xFF);
+        return s;
+    };
+    std::string indent(depth * 2, ' ');
+    bool isForm = chunk.id == assets::kFormTag;
+    if (isForm) {
+        std::cout << indent << "FORM(" << tagToString(chunk.formType) << ") ["
+                  << chunk.children.size() << " children]\n";
+    } else {
+        std::cout << indent << "CHNK(" << tagToString(chunk.id) << ") [" << chunk.data.size()
+                   << " bytes]\n";
+    }
+    bool isSmallLeaf = !isForm && chunk.data.size() <= 3000;
+    if (isSmallLeaf) {
+        const auto& bytes = chunk.data;
+        std::cout << indent << "  raw bytes (" << bytes.size() << "): " << std::hex;
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            if (i > 0 && i % 16 == 0) std::cout << "\n" << indent << "    ";
+            std::cout << std::setw(2) << std::setfill('0') << static_cast<int>(bytes.data()[i])
+                       << " ";
+        }
+        std::cout << std::dec << std::setfill(' ') << "\n";
+    }
+    for (const auto& child : chunk.children) {
+        dumpIffTree(child, depth + 1);
+    }
+}
+
+void runDumpPob(const CliOptions& opts) {
+    std::string archivePath = opts.clientPath + "\\data_other_00.tre";
+    assets::TreArchive archive(archivePath);
+    if (!archive.contains(opts.dumpPobPath)) {
+        std::cerr << "dump-pob: not found in archive: " << opts.dumpPobPath << "\n";
+        return;
+    }
+    auto bytes = archive.extract(opts.dumpPobPath);
+    auto topLevel = assets::IffReader::parse(bytes);
+    for (const auto& chunk : topLevel) {
+        dumpIffTree(chunk, 0);
+    }
 }
 
 // ---- Login (Milestone 1) -------------------------------------------------
@@ -1296,6 +1361,11 @@ int main(int argc, char** argv) {
     std::cerr << std::unitbuf;
     try {
         CliOptions opts = parseCommandLine(argc, argv);
+
+        if (!opts.dumpPobPath.empty()) {
+            runDumpPob(opts);
+            return 0;
+        }
 
         // One io_context for the whole run, shared by both SoeSession
         // instances below (login, then zone) - SoeSession doesn't own its

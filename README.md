@@ -34,14 +34,15 @@ Three goals drive the work, in order:
 - The complete login → character-select → zone-in sequence against a live Core3 server.
 - A schema-driven decoder for object baselines and deltas (the core of SWG's world-state synchronization) across the majority of SWG's object types.
 - A real, live 3D visualizer (`dummyclient --visualize`, Vulkan-based, Windows-only): real procedural terrain, real object/building/character geometry resolved directly from the actual client's own data files, real textures, player-driven WASD movement, and real cell-relative movement/interaction inside player-placed structures (including a full outbound interaction round-trip — e.g. using an elevator and having the server actually move the character to a different floor).
+- Real indoor collision: wall blocking, real portal-based room-transition detection, and continuous height-following while climbing or descending real multi-flight staircases and ramps.
 - A full-building inspection mode (a free noclip camera showing every real room of a building at once) for visual/scale assessment.
 - A real multi-threaded engine loop: networking, asset loading, and rendering each run on their own thread.
 - An offline pcap-based decoder for analyzing previously captured sessions.
 - A large automated test suite, a substantial fraction of it built on real byte fixtures captured from a live server, not synthetic data alone.
 
 **In progress / deliberately deferred:**
-- No general collision yet — real stairs/ramps and some building thresholds can't be navigated by walking alone. This is the current focus area.
 - Real portal-based visibility isn't implemented — a neighboring room visible through an open doorway doesn't render until you actually walk into it.
+- Terrain doesn't yet respond to building placement — the ground around a structure's foundation doesn't reflect the grading a real placed building would apply, which is visible right at a building's outer edge.
 - Textures are diffuse-only so far; animation playback, further lighting/material work, and general visual polish are still ahead.
 - Combat and crafting protocol decode — substantial, largely unexplored territory, intentionally sequenced after the movement/rendering foundation above is solid.
 

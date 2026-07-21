@@ -62,6 +62,14 @@ source code.
   mesh-parsing defect that had been silently discarding most of the real geometry on
   typical multi-material objects — recovered detail (entrance stairs, trim, panel
   seams) was visible immediately, independent of the texturing work itself.
+- **Real indoor collision**: wall blocking, real portal-based room-transition
+  detection (replacing an earlier bounding-box approximation), and continuous
+  stair/ramp height-following while climbing or descending real multi-flight
+  staircases. The floor-height problem in particular required decoding a second,
+  separate real navmesh file format distinct from a building's inline collision
+  geometry — a real switchback staircase (where a lower flight can share the same
+  horizontal footprint as its own upper entrance) is only solvable using that file's
+  real per-triangle adjacency data, not a simple raycast or point-in-polygon test.
 
 ## Process notes
 

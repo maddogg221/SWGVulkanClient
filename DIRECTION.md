@@ -15,15 +15,15 @@ order things are being tackled:
   on, and stay the top priority whenever a real gap is found there.
 - **Real rendering, incrementally.** Terrain, real object geometry, real character
   models, real building interiors, cell-relative movement/interaction, a full-
-  building inspection mode, and real textures on buildings/objects already work
-  today (see the README's Current Status). The current focus is refining this
-  foundation - real collision (so stairs/ramps and building thresholds work
-  naturally), animation playback, and general rendering/lighting quality - until
-  it's smooth, reliable, and visually consistent with the live game, followed by an
-  efficiency-focused rendering refactor. Gameplay systems (crafting, combat,
-  vehicles) are intentionally sequenced AFTER this, not alongside it - moving
-  through the world convincingly is the foundation those systems are built on top
-  of, not a parallel concern.
+  building inspection mode, real textures on buildings/objects, and real indoor
+  collision (walls, portal-based room transitions, stair/ramp climbing) already work
+  today (see the README's Current Status). The current focus is refining what's
+  left of this foundation - animation playback and general rendering/lighting
+  quality - until it's smooth, reliable, and visually consistent with the live game,
+  followed by an efficiency-focused rendering refactor. Gameplay systems (crafting,
+  combat, vehicles) are intentionally sequenced AFTER this, not alongside it -
+  moving through the world convincingly is the foundation those systems are built
+  on top of, not a parallel concern.
 - **Gameplay systems, PreCU-targeted.** When combat and profession systems
   eventually get built, the intent is **pre-Combat Upgrade (pre-2005)** authenticity,
   not the NGE (New Game Enhancements) systems that shipped later - a deliberate
