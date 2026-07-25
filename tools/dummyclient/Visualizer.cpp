@@ -10,6 +10,7 @@
 
 #include "Visualizer.h"
 
+#include "PngWriter.h"
 #include "StringUtil.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -2446,6 +2448,27 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     DirectX::XMFLOAT3 lastKnownSelfPos{0.0f, 0.0f, 0.0f};
     float lastKnownSelfYawRadians = 0.0f; // for the minimap's facing indicator
 
+    // Live visual-comparison diagnostic aid, added for walk-animation
+    // debugging - the user's own point: describing a moving defect in words
+    // or a single screenshot kept missing the actual problem. Locks the
+    // normal FollowCamera's yaw to one of 4 fixed offsets from self's own
+    // current facing (front/right/back/left, matched to what the real
+    // official client can be manually aligned to via its own compass/
+    // heading readout - see PHASE_21_STATUS.md) instead of the usual
+    // mouse-driven orbit, then optionally captures a burst of real PNG
+    // frames at a fixed interval to a per-angle folder so a full walk cycle
+    // can be reviewed frame-by-frame afterward, not just at whatever moment
+    // a manual screenshot happened to land on. Pitch/zoom (mouse wheel)
+    // still work normally while locked - only yaw is forced.
+    bool lockedCameraMode = false;
+    bool lockedCameraKeyWasDown = false;
+    int lockedCameraAngleIndex = 0; // 0/1/2/3 -> 0/90/180/270 degrees
+    bool cycleAngleKeyWasDown = false;
+    bool burstCaptureActive = false;
+    bool burstCaptureKeyWasDown = false;
+    int burstCaptureFrameCounter = 0;
+    std::chrono::steady_clock::time_point lastBurstCaptureTime{};
+
     // Player movement (Phase 13) - a LOCALLY predicted position/facing,
     // driven by WASD input every frame and only ever seeded ONCE from
     // lastKnownSelfPos (the raw, server-reported position) the first frame
@@ -2608,7 +2631,11 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                  "the finger+elbow/wrist chain, 'G' to cycle a forced composition-variant override "
                  "for that same chain, or 'H' to cycle a forced axis-fix-variant override for that "
                  "same chain (Phase 21 diagnostics - widened 2026-07-23 to also cover "
-                 "forearm/ulna/wrist since they share the same artifact). Close the window to exit.\n";
+                 "forearm/ulna/wrist since they share the same artifact). Press 'K' to lock the "
+                 "camera to a fixed angle relative to self's own facing (0/90/180/270deg), 'J' to "
+                 "cycle which of those 4 angles is active, and 'P' to start/stop a burst PNG "
+                 "screenshot capture (~6/sec) into diagnostic_screenshots/<angle>deg/ - added for "
+                 "live walk-cycle visual comparison work. Close the window to exit.\n";
 
     using Clock = std::chrono::steady_clock;
     auto lastFrameTime = Clock::now();
@@ -2674,6 +2701,37 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
             std::cout << "[VISUALIZER] inspection mode " << (inspectionMode ? "ON" : "OFF") << "\n";
         }
         inspectKeyWasDown = inspectKeyDown;
+
+        // Locked-angle diagnostic camera - see lockedCameraMode's own
+        // comment. 'K' toggles it on/off; 'J' cycles which of the 4 fixed
+        // angles is active while it's on; 'P' starts/stops a burst capture
+        // of real PNG frames at whatever angle is currently locked. Not
+        // meaningful in inspection mode (that uses the free FlyCamera
+        // instead), so these only affect the normal FollowCamera path.
+        bool lockedCameraKeyDown = renderer::Window::isKeyDown('K');
+        if (lockedCameraKeyDown && !lockedCameraKeyWasDown) {
+            lockedCameraMode = !lockedCameraMode;
+            std::cout << "[VISUALIZER] locked diagnostic camera "
+                       << (lockedCameraMode ? "ON" : "OFF")
+                       << " (angle=" << (lockedCameraAngleIndex * 90) << "deg)\n";
+        }
+        lockedCameraKeyWasDown = lockedCameraKeyDown;
+
+        bool cycleAngleKeyDown = renderer::Window::isKeyDown('J');
+        if (cycleAngleKeyDown && !cycleAngleKeyWasDown && lockedCameraMode) {
+            lockedCameraAngleIndex = (lockedCameraAngleIndex + 1) % 4;
+            std::cout << "[VISUALIZER] locked diagnostic camera angle = "
+                       << (lockedCameraAngleIndex * 90) << "deg\n";
+        }
+        cycleAngleKeyWasDown = cycleAngleKeyDown;
+
+        bool burstCaptureKeyDown = renderer::Window::isKeyDown('P');
+        if (burstCaptureKeyDown && !burstCaptureKeyWasDown) {
+            burstCaptureActive = !burstCaptureActive;
+            std::cout << "[VISUALIZER] burst screenshot capture "
+                       << (burstCaptureActive ? "STARTED" : "STOPPED") << "\n";
+        }
+        burstCaptureKeyWasDown = burstCaptureKeyDown;
 
         // Phase 21 (animation) diagnostic - forces self's animated skinning
         // to sample the real BIND pose only (no animation clip), isolating
@@ -3487,6 +3545,18 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         if (inspectionMode) {
             flyCamera.update(window, deltaSeconds);
         } else {
+            if (lockedCameraMode) {
+                // Set BEFORE update() (not after) so this frame's own
+                // position gets computed from the correct forced yaw
+                // immediately, rather than lagging a frame behind - see
+                // lockedCameraMode's own comment. Only yaw is forced;
+                // update() still applies mouse-driven pitch/zoom normally
+                // as long as the right mouse button isn't held (holding it
+                // would fight this override, but nothing stops it from
+                // being reasserted next frame).
+                camera.yaw = predictedSelfYawRadians +
+                             static_cast<float>(lockedCameraAngleIndex) * (DirectX::XM_PI / 2.0f);
+            }
             camera.update(window, predictedSelfPos, deltaSeconds);
         }
         DirectX::XMMATRIX viewMatrixNow =
@@ -3905,14 +3975,34 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                         float ankleDist = dist3(lAnklePos, rAnklePos);
                                         float kneeDist = dist3(lKneePos, rKneePos);
 
+                                        // Knee LATERAL check - added after real screenshot burst
+                                        // capture (diagnostic_screenshots/, new this session) finally
+                                        // let this be directly SEEN rather than inferred: at peak
+                                        // stride extension, the swinging leg's thigh/knee visibly
+                                        // swings inward across the body's own midline, even though
+                                        // the ANKLE (checked above) recovers back to the correct side
+                                        // by the time it plants - a real "knock-kneed" pattern the
+                                        // ankle-only lateral check above could never have caught,
+                                        // since it only ever looked at the far end of the limb. Same
+                                        // projection as the ankle's own lLateral/rLateral, just
+                                        // applied to the knee (shin bone) position instead.
+                                        float lKneeLateral = (lKneePos.x - rootPos.x) * right.x +
+                                                              (lKneePos.y - rootPos.y) * right.y +
+                                                              (lKneePos.z - rootPos.z) * right.z;
+                                        float rKneeLateral = (rKneePos.x - rootPos.x) * right.x +
+                                                              (rKneePos.y - rootPos.y) * right.y +
+                                                              (rKneePos.z - rootPos.z) * right.z;
+
                                         std::cout << "[ANIMDBG] LEG SANITY t=" << selfAnimTimeSeconds
                                                    << " kneeBulge(+fwd/-back) L=" << lBulge << " R=" << rBulge
                                                    << "  thighExtent L=" << lExtent << " R=" << rExtent
                                                    << " (samesign=" << ((lExtent > 0) == (rExtent > 0) ? "IN-PHASE(bad?)" : "opposite(good)")
-                                                   << ")  LATERAL L=" << lLateral << " R=" << rLateral
-                                                   << "  ankleDist=" << ankleDist << " kneeDist=" << kneeDist
+                                                   << ")  LATERAL(ankle) L=" << lLateral << " R=" << rLateral
                                                    << " (crossed=" << ((lLateral > 0) == (rLateral > 0) ? "SAME-SIDE(BAD)" : "opposite(good)")
-                                                   << ")\n";
+                                                   << ")  LATERAL(knee) L=" << lKneeLateral << " R=" << rKneeLateral
+                                                   << " (crossed=" << ((lKneeLateral > 0) == (rKneeLateral > 0) ? "SAME-SIDE(BAD)" : "opposite(good)")
+                                                   << ")  ankleDist=" << ankleDist << " kneeDist=" << kneeDist
+                                                   << "\n";
                                     }
                                 }
                             }
@@ -4546,6 +4636,37 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         }
 
         gfx.endFrame();
+
+        // Burst screenshot capture (see burstCaptureActive's own comment) -
+        // throttled to ~6/sec real time so a walk cycle produces a
+        // reviewable number of frames instead of thousands. Must run right
+        // after endFrame() and before the next beginFrame() - see
+        // captureFrameRGBA8's own comment on why.
+        if (burstCaptureActive) {
+            auto nowCapture = std::chrono::steady_clock::now();
+            if (nowCapture - lastBurstCaptureTime > std::chrono::milliseconds(166)) {
+                lastBurstCaptureTime = nowCapture;
+                std::vector<uint8_t> pixels;
+                uint32_t capturedWidth = 0;
+                uint32_t capturedHeight = 0;
+                if (gfx.captureFrameRGBA8(pixels, capturedWidth, capturedHeight)) {
+                    std::filesystem::path dir =
+                        std::filesystem::path("diagnostic_screenshots") /
+                        (std::to_string(lockedCameraAngleIndex * 90) + "deg");
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    char frameFile[64];
+                    std::snprintf(frameFile, sizeof(frameFile), "frame_%04d.png",
+                                  burstCaptureFrameCounter++);
+                    std::string outPath = (dir / frameFile).string();
+                    if (dummyclient::writePngRGBA8(outPath, capturedWidth, capturedHeight, pixels)) {
+                        std::cout << "[VISUALIZER] captured " << outPath << "\n";
+                    } else {
+                        std::cout << "[VISUALIZER] failed to write " << outPath << "\n";
+                    }
+                }
+            }
+        }
 
         auto frameElapsed = Clock::now() - now;
         if (frameElapsed < targetFrameTime) {

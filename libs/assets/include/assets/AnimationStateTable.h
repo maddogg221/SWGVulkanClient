@@ -71,6 +71,24 @@ struct AnimationNode {
 
     std::string parameterName;  // Switch only
 
+    // Switch only - the real `CHNK VALS` value->child-index mapping
+    // (confirmed byte-exact 2026-07-25 against the leaked original
+    // StringSelectorSkeletalAnimationTemplate.cpp source: real selection is
+    // a literal string lookup of the runtime environment variable's value
+    // against this table, NOT filename inference - see
+    // AnimationStateTable.cpp's own comment on the wrong heuristic this
+    // replaced). Empty if the switch has no real VALS chunk at all (rare
+    // but real - see switchDefaultIndex).
+    std::vector<std::pair<std::string, int>> switchValueMap;
+    // Switch only - the real `CHNK DFLT` child index, -1 if this switch has
+    // no real DFLT chunk. The real client falls back to this whenever the
+    // runtime value isn't found in switchValueMap (or no value is known at
+    // all) - this is the real, authoritative "default" signal, not "first
+    // child in file order" (which this project used as an approximation
+    // before DFLT was decoded, and which is NOT always correct - see the
+    // "mood" switch comment on AnimationSelectionContext).
+    int switchDefaultIndex = -1;  // Switch only
+
     std::vector<std::string> triggerNames;  // Variant only, real ACTN names
     float minDurationSeconds = 0.0f;        // Variant only
     float maxDurationSeconds = 0.0f;        // Variant only
@@ -106,15 +124,14 @@ struct AnimationStateTableData {
 };
 
 // What to select with, given a real state's node tree. `gender` should be
-// one of "male"/"female" (case-insensitive substring match against a real
-// Switch's own real ANMS-order children - see AnimationStateTable.cpp's
-// own comment on why file order, not a decoded value table, is used to
-// tell the branches apart) - any other value falls back to the first
-// child. There is deliberately no "mood"/trigger context yet: this
+// one of "male"/"female" - looked up directly in a real "gender" Switch's
+// own `switchValueMap` (the real mechanism - see AnimationNode's own
+// comment), falling back to `switchDefaultIndex` if the value isn't
+// present. There is deliberately no "mood"/trigger context yet: this
 // project does not track real server-driven mood/emote state, so any
 // `Switch` whose `parameterName` isn't "gender" (confirmed real: "mood",
 // but treated generically - ANY unrecognized switch name gets the same
-// treatment) picks a stable, sensible untriggered default instead of
+// treatment) always falls through to `switchDefaultIndex` instead of
 // modeling the real trigger-matching system.
 struct AnimationSelectionContext {
     std::string gender;

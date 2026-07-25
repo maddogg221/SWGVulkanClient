@@ -20,6 +20,12 @@ constexpr uint32_t kAnmsTag = 0x414E4D53;  // 'ANMS'
 constexpr uint32_t kLoopTag = 0x4C4F4F50;  // 'LOOP'
 constexpr uint32_t kActnTag = 0x4143544E;  // 'ACTN'
 constexpr uint32_t kPunfTag = 0x50554E46;  // 'PUNF'
+// Real Switch value->index mapping / default-index chunks (confirmed
+// byte-exact 2026-07-25 against the leaked original
+// StringSelectorSkeletalAnimationTemplate.cpp source - see
+// AnimationNode::switchValueMap's own comment).
+constexpr uint32_t kValsTag = 0x56414C53;  // 'VALS'
+constexpr uint32_t kDfltTag = 0x44464C54;  // 'DFLT'
 
 bool equalsIgnoreCase(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
@@ -28,14 +34,24 @@ bool equalsIgnoreCase(const std::string& a, const std::string& b) {
     });
 }
 
-// Whether ANY real clip anywhere in this subtree carries a real
-// gender-specific filename prefix ("all_f_"/"all_m_") - scanning the WHOLE
-// branch rather than just whichever single clip a default selection would
-// land on, since the real DEFAULT (untriggered) clip in a real gender
-// branch is often a shared, non-gendered file ("all_b_...") - only some
-// specific mood variants (e.g. a real female-specific sitting/dance
-// animation) actually carry the gendered prefix, so only a full-subtree
-// scan reliably tells two branches apart.
+// Fallback ONLY - the real client's own selection mechanism, confirmed
+// byte-exact 2026-07-25 (see AnimationNode::switchValueMap's own comment)
+// falls back to child index 0 whenever a Switch's real CHNK VALS doesn't
+// contain the runtime value AND it has no real CHNK DFLT either -
+// confirmed via reading the real runtime StringSelectorSkeletalAnimation-
+// Template::getSelectionIndexForValue(), which does exactly that. Directly
+// scanning real game data found this IS the actual situation for every
+// real "gender" switch checked in a real live `all_m.lat` (664 states
+// scanned, VALS always empty for gender, DFLT present only sometimes) -
+// meaning the real, literal on-disk mechanism can't distinguish male from
+// female for these states at all. Rather than trust "always pick child 0"
+// (unverifiable against the real running client without further live RE,
+// and structurally suspicious: real gender-specific content, e.g.
+// "all_f_dnc_f_belly_loop_high.ans", does exist in the OTHER branch for at
+// least one real case checked), this scans each branch's whole subtree for
+// a real gender-specific clip filename - the same heuristic this project
+// used before decoding VALS/DFLT, already live-verified correct. Used
+// ONLY when the real VALS/DFLT data genuinely has nothing to say.
 bool subtreeHasGenderHint(const AnimationNode& node, bool wantFemale) {
     if (node.kind == AnimationNodeKind::Clip) {
         const char* marker = wantFemale ? "/all_f_" : "/all_m_";
@@ -114,6 +130,31 @@ AnimationNode parseSwitch(const IffChunk& form) {
         for (const IffChunk& option : child.children) {
             if (option.id != kFormTag) continue;  // skip ANMS's own leading CHNK INFO count
             node.children.push_back(parseNode(option));
+        }
+    }
+    // Real CHNK VALS/DFLT are direct siblings of FORM ANMS inside this
+    // switch's own inner FORM 0000, coming AFTER it in real file order
+    // (confirmed against the leaked original write() implementation) - a
+    // recursive findFirstChunk() would be wrong here: an ANMS option can
+    // itself be a nested Switch with its OWN VALS/DFLT, and a depth-first
+    // search would wrongly descend into that nested subtree looking for a
+    // match before ever reaching these two chunks at THIS level. Scanned as
+    // direct (non-recursive) children only, for exactly that reason.
+    for (const IffChunk& child : inner->children) {
+        if (child.id == kValsTag) {
+            soe::PacketBuffer buf = child.data;
+            buf.resetReadCursor();
+            uint16_t valueCount = buf.readUint16();
+            node.switchValueMap.reserve(valueCount);
+            for (uint16_t i = 0; i < valueCount; ++i) {
+                std::string value = readNulTerminatedString(buf);
+                int16_t templateIndex = static_cast<int16_t>(buf.readUint16());
+                node.switchValueMap.emplace_back(std::move(value), static_cast<int>(templateIndex));
+            }
+        } else if (child.id == kDfltTag) {
+            soe::PacketBuffer buf = child.data;
+            buf.resetReadCursor();
+            node.switchDefaultIndex = static_cast<int16_t>(buf.readUint16());
         }
     }
     return node;
@@ -230,46 +271,56 @@ std::string selectAnimationClip(const AnimationNode& root, const AnimationSelect
 
             case AnimationNodeKind::Switch: {
                 if (node->children.empty()) return {};
-                if (equalsIgnoreCase(node->parameterName, "gender") && !context.gender.empty()) {
-                    // Real branches aren't labelled with their own gender
-                    // anywhere directly decoded yet - classified instead
-                    // by scanning each branch's WHOLE subtree for any real
-                    // gender-specific clip (see subtreeHasGenderHint's own
-                    // comment on why a full scan, not just the default
-                    // selected clip, is needed).
-                    bool wantsFemale = equalsIgnoreCase(context.gender, "female");
-                    const AnimationNode* matched = nullptr;
-                    for (const AnimationNode& option : node->children) {
-                        if (subtreeHasGenderHint(option, wantsFemale)) {
-                            matched = &option;
+
+                // The REAL selection mechanism (confirmed byte-exact
+                // 2026-07-25 against the leaked original
+                // StringSelectorSkeletalAnimationTemplate.cpp source -
+                // fetchConstAnimationTemplateForValue()): look up the
+                // runtime value for this switch's own parameterName
+                // directly in its real switchValueMap; if not found (or no
+                // runtime value is known at all - e.g. the real "mood"
+                // switch, which this project doesn't track server-driven
+                // trigger state for), fall back to switchDefaultIndex - the
+                // real, authoritative default, not a guessed one. This
+                // replaces an earlier heuristic (scanning each branch's
+                // whole subtree for a gender-specific filename) that
+                // happened to produce correct results on every case tested
+                // but was never the real mechanism.
+                int selectedIndex = -1;
+                bool isGenderSwitch = equalsIgnoreCase(node->parameterName, "gender") && !context.gender.empty();
+                if (isGenderSwitch) {
+                    for (const auto& valueEntry : node->switchValueMap) {
+                        if (equalsIgnoreCase(valueEntry.first, context.gender)) {
+                            selectedIndex = valueEntry.second;
                             break;
                         }
                     }
-                    // No branch carries a real gender-specific clip at all
-                    // for this particular state (most states are fully
-                    // shared, "all_b_") - branches are otherwise
-                    // structurally interchangeable for selection purposes
-                    // here, so just take the first.
-                    node = matched != nullptr ? matched : &node->children[0];
-                    continue;
                 }
-                // Any other real switch (confirmed real: "mood") - no
-                // server-driven trigger state is tracked, so this can't
-                // pick a real, triggered variant. The naive-looking
-                // "prefer a Variant with an empty real ACTN trigger list"
-                // heuristic was tried and found WRONG against real data:
-                // a real, empty-ACTN entry can just as easily be a
-                // special always-technically-untriggered filler (a real
-                // hired-entertainer dance/music loop was found this way,
-                // tagged `PUNF="zero_speed"` rather than being a normal
-                // idle at all) as it can be a genuine default. What DOES
-                // hold, confirmed against real data for multiple real
-                // states/branches: the state's own first real child in
-                // file order is consistently the intended default idle
-                // (e.g. a real "breathe calmly" variant, first in both
-                // real gender branches of a real checked state) - simpler
-                // and, unlike the trigger-based guess, actually correct.
-                node = &node->children[0];
+                if (selectedIndex < 0 && node->switchDefaultIndex >= 0) {
+                    selectedIndex = node->switchDefaultIndex;
+                }
+                // Real data has nothing to say (confirmed real, not just
+                // theoretical - see subtreeHasGenderHint's own comment):
+                // for a gender switch specifically, fall back to the
+                // filename-scan heuristic rather than blindly taking child
+                // 0, since child 0 is not reliably the correct branch.
+                if (selectedIndex < 0 && isGenderSwitch) {
+                    bool wantsFemale = equalsIgnoreCase(context.gender, "female");
+                    for (size_t i = 0; i < node->children.size(); ++i) {
+                        if (subtreeHasGenderHint(node->children[i], wantsFemale)) {
+                            selectedIndex = static_cast<int>(i);
+                            break;
+                        }
+                    }
+                }
+                // Last-resort fallback for malformed/incomplete real data,
+                // or a non-gender switch (confirmed real: "mood") this
+                // project has no server-driven trigger state to resolve -
+                // the state's own first real child in file order.
+                if (selectedIndex < 0 || selectedIndex >= static_cast<int>(node->children.size())) {
+                    selectedIndex = 0;
+                }
+                node = &node->children[static_cast<size_t>(selectedIndex)];
                 continue;
             }
 

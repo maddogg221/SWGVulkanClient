@@ -42,7 +42,7 @@ Three goals drive the work, in order:
 - A large automated test suite, a substantial fraction of it built on real byte fixtures captured from a live server, not synthetic data alone.
 
 **In progress / deliberately deferred:**
-- The walk animation's leg motion doesn't yet look correct live, despite passing every geometric sanity check tried so far — see `PROGRESS.md` for the numeric-diagnostic approach being used to track it down.
+- The walk animation's stride length doesn't yet match the real client (reaches noticeably farther than it should) — narrowed down via direct side-by-side comparison against real official-client footage, see `PROGRESS.md`.
 - Real portal-based visibility isn't implemented — a neighboring room visible through an open doorway doesn't render until you actually walk into it.
 - Terrain doesn't yet respond to building placement — the ground around a structure's foundation doesn't reflect the grading a real placed building would apply, which is visible right at a building's outer edge.
 - Textures are diffuse-only so far; further lighting/material work and general visual polish are still ahead.

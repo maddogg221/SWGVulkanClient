@@ -2596,4 +2596,82 @@ void VulkanRenderer::endFrame() {
     currentFrame_ = (currentFrame_ + 1) % kMaxFramesInFlight;
 }
 
+bool VulkanRenderer::captureFrameRGBA8(std::vector<uint8_t>& outRGBA, uint32_t& outWidth,
+                                        uint32_t& outHeight) const {
+    const uint32_t width = swapchainExtent_.width;
+    const uint32_t height = swapchainExtent_.height;
+    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(width) * height * 4;
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VmaAllocation stagingAllocation = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo stagingInfo{};
+    stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingInfo.size = byteSize;
+    stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo stagingAllocInfo{};
+    stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+    stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VmaAllocationInfo stagingAllocResult{};
+    if (vmaCreateBuffer(allocator_, &stagingInfo, &stagingAllocInfo, &stagingBuffer,
+                         &stagingAllocation, &stagingAllocResult) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkCommandBuffer cmd = beginSingleTimeCommands();
+
+    // Swapchain image is in PRESENT_SRC_KHR right after endFrame()'s own
+    // vkQueuePresentKHR - transition to TRANSFER_SRC_OPTIMAL for the copy.
+    // No transition back afterward: the render pass that draws the NEXT
+    // frame into this same image uses initialLayout=UNDEFINED (see
+    // colorAttachment's own setup), so it doesn't care what layout this
+    // image is left in.
+    VkImageMemoryBarrier toTransferSrc{};
+    toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferSrc.image = swapchainImages_[currentImageIndex_];
+    toTransferSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferSrc.subresourceRange.levelCount = 1;
+    toTransferSrc.subresourceRange.layerCount = 1;
+    toTransferSrc.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                          nullptr, 0, nullptr, 1, &toTransferSrc);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;   // tightly packed
+    region.bufferImageHeight = 0; // tightly packed
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(cmd, swapchainImages_[currentImageIndex_],
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, 1, &region);
+
+    endSingleTimeCommands(cmd); // waits for the GPU to finish before returning
+
+    outWidth = width;
+    outHeight = height;
+    outRGBA.resize(static_cast<size_t>(width) * height * 4);
+    const uint8_t* bgra = static_cast<const uint8_t*>(stagingAllocResult.pMappedData);
+    // Swapchain format is BGRA8 (see chooseSwapSurfaceFormat's own
+    // preference) - swap to RGBA8 here so callers/PNG writers don't each
+    // need to know the swapchain's own channel order.
+    for (size_t px = 0; px < static_cast<size_t>(width) * height; ++px) {
+        outRGBA[px * 4 + 0] = bgra[px * 4 + 2];
+        outRGBA[px * 4 + 1] = bgra[px * 4 + 1];
+        outRGBA[px * 4 + 2] = bgra[px * 4 + 0];
+        outRGBA[px * 4 + 3] = 255;
+    }
+
+    vmaDestroyBuffer(allocator_, stagingBuffer, stagingAllocation);
+    return true;
+}
+
 } // namespace renderer

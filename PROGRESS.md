@@ -100,15 +100,24 @@ worth stating plainly for anyone evaluating the codebase:
   assumed to inherit correctness from related work.
 - **Detect and stop, don't guess.** Unknown or ambiguous wire data and asset bytes
   produce a clear, logged failure in this codebase — never a silent misdecode.
-- **When a visual defect resists description, measure it instead.** A live walk-
-  cycle animation defect proved very hard to pin down from screenshots and verbal
-  description alone. The fix was to stop guessing from pictures and add live,
+- **When a visual defect resists description, measure it — and then look
+  directly.** A live walk-cycle animation defect proved very hard to pin down
+  from screenshots and verbal description alone. The first step was live,
   numeric diagnostics computed directly from real skeleton bone positions while
   walking against a real server — signed geometric checks (does a knee bend the
   anatomically correct direction, do the left and right limbs alternate phase, does
   either foot cross the body's own centerline) plus a direct 3D distance
-  measurement between corresponding joints. Several of these came back clean,
-  which was itself useful information: it ruled out a skeleton-math bug of the
-  same class as the earlier quaternion byte-order fix, and pointed instead toward
-  the mesh geometry or its vertex-weight blending as the more likely remaining
-  cause — still open as of this writing.
+  measurement between corresponding joints. Every one of these came back clean,
+  which was itself useful — it ruled out a skeleton-math bug of the same class
+  as the earlier quaternion byte-order fix. What finally settled the question was
+  building an actual screenshot-comparison capability: a locked-camera-angle
+  capture mode added to the client itself, paired with matching frames pulled
+  from real official-client footage at the same angles. Side by side, the defect
+  turned out to be **stride length**, not a lateral/crossing bug at all — the
+  official client's stride is short and contained; this project's reaches
+  noticeably farther on both legs and arms, an effect that reads as "crossing"
+  in a front-on view purely from perspective. Real per-keyframe rotation
+  magnitudes for the leg bones checked out plausible on their own, so the actual
+  cause is most likely in how those rotations compose rather than the recorded
+  values themselves — still open, but now a specific, narrow target instead of
+  an open-ended visual impression.

@@ -189,6 +189,22 @@ public:
 
     void endFrame();
 
+    // Diagnostic capture aid, added for live visual comparison work (walk
+    // animation debugging) - reads back the swapchain image that was JUST
+    // presented by the most recent endFrame() call and returns it as tightly
+    // packed, top-to-bottom RGBA8 (converted from the swapchain's native
+    // BGRA8 order). Must be called after endFrame() and before the next
+    // beginFrame() - relies on the swapchain image at currentImageIndex_
+    // still holding this frame's contents and nothing yet queued to
+    // overwrite it (true in that window because the render pass's own
+    // color attachment uses initialLayout=UNDEFINED, i.e. "discard whatever
+    // was there" - this capture doesn't need to leave the image in any
+    // particular layout afterward). Does a full GPU wait-idle internally
+    // (via endSingleTimeCommands()) - fine for an occasional debug capture,
+    // never called in the normal per-frame path.
+    bool captureFrameRGBA8(std::vector<uint8_t>& outRGBA, uint32_t& outWidth,
+                            uint32_t& outHeight) const;
+
 private:
     static constexpr int kMaxFramesInFlight = 2;
 
