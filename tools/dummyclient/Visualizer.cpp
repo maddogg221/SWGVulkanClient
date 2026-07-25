@@ -1,4 +1,4 @@
-// The crude wireframe/real-mesh visualizer - Windows/Vulkan only (see
+﻿// The crude wireframe/real-mesh visualizer - Windows/Vulkan only (see
 // libs/renderer). Extracted out of main.cpp 2026-07-18 (was ~640 lines
 // embedded in a 2200+-line file, the single largest concentration of
 // application-level logic in tools/dummyclient) so future rendering work
@@ -28,6 +28,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "animation/SkeletalPose.h"
+#include "assets/AnimationClip.h"
+#include "assets/AnimationStateTable.h"
 #include "assets/AppearanceTemplate.h"
 #include "assets/BuildingLayout.h"
 #include "assets/DdsImage.h"
@@ -37,6 +40,7 @@
 #include "assets/SkeletalAppearance.h"
 #include "assets/SkeletalMesh.h"
 #include "assets/SkeletalMeshLod.h"
+#include "assets/Skeleton.h"
 #include "assets/StaticMesh.h"
 #include "assets/TreArchive.h"
 #include "renderer/Camera.h"
@@ -969,6 +973,27 @@ private:
     std::unordered_map<uint32_t, std::string> crcToTemplatePath_;
 };
 
+// Real per-body-part CPU-side data needed for animation (Phase 21) - unlike
+// RealSkeletalMeshResolver::resolveMeshDataOnly()'s own MeshData (bind-pose
+// geometry only, bone weights discarded), this keeps everything a runtime
+// skinning pass needs: the real per-shader submeshes (each carrying its own
+// `sourceVertexIndices`, see SkeletalMesh.h), this body part's own real
+// bone-name list, and its real mesh-level per-vertex bone weights.
+struct AnimatedMeshPart {
+    std::vector<assets::SkeletalMeshSubmesh> submeshes;
+    std::vector<std::string> boneNames;
+    std::vector<std::vector<assets::BoneWeight>> vertexWeights;
+};
+
+// Real animation resolution for ONE creature template (Phase 21, v1
+// deliberately self-only - see runVisualizer()'s own comment on why other
+// visible players/creatures still render bind-pose only this phase).
+struct SelfAnimationData {
+    assets::SkeletonData skeleton;
+    std::vector<AnimatedMeshPart> meshParts;
+    assets::AnimationStateTableData stateTable; // real states, empty if resolution failed/no LATX
+};
+
 // Resolves a real objectCrc to real SKELETAL mesh geometry (Phase 15) -
 // walks the real chain this phase's research discovered and verified
 // against real data: .iff (SharedObjectTemplate) -> .sat
@@ -989,6 +1014,7 @@ public:
     explicit RealSkeletalMeshResolver(const std::string& clientPath) {
         static const char* kArchiveNames[] = {
             "data_other_00.tre",
+            "data_animation_00.tre", // real .lat/.ans files (Phase 21, animation)
             "data_skeletal_mesh_00.tre",
             "data_skeletal_mesh_01.tre",
             "data_sku1_00.tre",
@@ -1111,6 +1137,195 @@ public:
         return submeshMeshes;
     }
 
+    // Real animation resolution (Phase 21) - same real .iff -> .sat chain as
+    // resolveMeshDataOnly() above, but keeps the full per-body-part
+    // submesh/bone-weight data AND additionally resolves the real skeleton
+    // (.skt) and animation state table (.lat, via the .sat's own LATX
+    // chunk). Called once, synchronously (not via AssetWorkerThread - a
+    // one-time few-ms cost for a single object is fine, unlike the
+    // streaming-many-creatures case the async pipeline exists for). Returns
+    // nullopt on any hard failure (no candidate template, .iff/.sat/.skt
+    // unreadable) - a missing/unreadable LATX or individual body part is
+    // tolerated (empty stateTable / that part just skipped), matching this
+    // project's established per-part graceful-fallback convention.
+    std::optional<SelfAnimationData> resolveSelfAnimationData(uint32_t objectCrc) {
+        auto candidateIt = crcToTemplatePath_.find(objectCrc);
+        if (candidateIt == crcToTemplatePath_.end()) {
+            return std::nullopt;
+        }
+        const std::string& realIffPath = candidateIt->second;
+
+        auto iffBytes = tryExtract(realIffPath);
+        if (!iffBytes.has_value()) {
+            return std::nullopt;
+        }
+        assets::SharedObjectTemplateData sharedTemplate;
+        try {
+            sharedTemplate = assets::SharedObjectTemplate::parse(*iffBytes);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+
+        auto satBytes = tryExtract(sharedTemplate.appearanceFilename);
+        if (!satBytes.has_value()) {
+            return std::nullopt;
+        }
+        assets::SkeletalAppearanceData appearance;
+        try {
+            appearance = assets::SkeletalAppearance::parse(*satBytes);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+
+        auto sktBytes = tryExtract(appearance.skeletonFilename);
+        if (!sktBytes.has_value()) {
+            return std::nullopt;
+        }
+        SelfAnimationData result;
+        try {
+            result.skeleton = assets::Skeleton::parse(*sktBytes);
+        } catch (const std::exception& e) {
+            std::cerr << "[ANIM] skeleton parse failed for " << appearance.skeletonFilename << ": "
+                       << e.what() << "\n";
+            return std::nullopt;
+        }
+
+        for (const auto& lmgPath : appearance.meshFilenames) {
+            auto lmgBytes = tryExtract(lmgPath);
+            if (!lmgBytes.has_value()) continue;
+            assets::SkeletalMeshLodData lod;
+            try {
+                lod = assets::SkeletalMeshLod::parse(*lmgBytes);
+            } catch (const std::exception&) {
+                continue;
+            }
+            auto mgnBytes = tryExtract(lod.highestDetailMeshFilename);
+            if (!mgnBytes.has_value()) continue;
+            assets::SkeletalMeshData skelMesh;
+            try {
+                skelMesh = assets::SkeletalMesh::parse(*mgnBytes);
+            } catch (const std::exception&) {
+                continue;
+            }
+            if (skelMesh.submeshes.empty()) continue;
+
+            AnimatedMeshPart part;
+            part.submeshes = std::move(skelMesh.submeshes);
+            part.boneNames = std::move(skelMesh.boneNames);
+            part.vertexWeights = std::move(skelMesh.vertexWeights);
+            result.meshParts.push_back(std::move(part));
+        }
+
+        if (!appearance.latFilename.empty()) {
+            auto latBytes = tryExtract(appearance.latFilename);
+            if (latBytes.has_value()) {
+                try {
+                    result.stateTable = assets::AnimationStateTable::parse(*latBytes);
+                } catch (const std::exception& e) {
+                    std::cerr << "[ANIM] .lat parse failed for " << appearance.latFilename << ": "
+                               << e.what() << "\n";
+                }
+            }
+        }
+
+        std::cout << "[ANIM] resolved self animation data: " << realIffPath << " -> "
+                   << result.meshParts.size() << " body parts, " << result.skeleton.bones.size()
+                   << " bones, " << result.stateTable.states.size() << " real animation states\n";
+        // Phase 21 diagnostic - real skeleton bone names, one-time dump, to
+        // directly compare against a real clip's own XFIN bone names rather
+        // than assume they match.
+        std::cout << "[ANIMDBG] skeleton bone names: ";
+        for (size_t i = 0; i < result.skeleton.bones.size(); ++i) {
+            std::cout << "[" << i << "]" << result.skeleton.bones[i].name << " ";
+        }
+        std::cout << "\n";
+        // Phase 21 diagnostic - real bone hierarchy (name + parentIndex,
+        // resolved to the parent's own name) - added while investigating
+        // the finger "sail" artifact, to directly verify the real skeleton
+        // parses the deepest chains (thumb/index/ring) with correct parent
+        // links, not just that a plausible-looking name list exists.
+        std::cout << "[ANIMDBG] skeleton hierarchy:\n";
+        for (size_t i = 0; i < result.skeleton.bones.size(); ++i) {
+            int32_t parent = result.skeleton.bones[i].parentIndex;
+            std::string parentName = "(none)";
+            if (parent >= 0 && static_cast<size_t>(parent) < result.skeleton.bones.size()) {
+                parentName = result.skeleton.bones[static_cast<size_t>(parent)].name;
+            }
+            std::cout << "  [" << i << "]" << result.skeleton.bones[i].name << " parentIndex=" << parent
+                       << " parentName=" << parentName << "\n";
+        }
+        // Phase 21 diagnostic - real per-body-part mesh bone names (from
+        // each .mgn's own XFNM chunk) - compared against the skeleton
+        // bone names above to confirm case/naming actually matches for
+        // mesh-to-skeleton binding too, not just clip-to-skeleton.
+        for (size_t pi = 0; pi < result.meshParts.size(); ++pi) {
+            std::cout << "[ANIMDBG] meshPart[" << pi << "] bone names: ";
+            for (size_t bi = 0; bi < result.meshParts[pi].boneNames.size(); ++bi) {
+                std::cout << "[" << bi << "]" << result.meshParts[pi].boneNames[bi] << " ";
+            }
+            std::cout << "\n";
+        }
+        // Phase 21 diagnostic - flags any real triangle whose longest edge,
+        // measured in BIND-POSE (unanimated) local space, is suspiciously
+        // large relative to typical mesh-part scale - added while
+        // investigating the finger "sail" artifact after ruling out
+        // rotation decode, bind pose data, composition order, skinning
+        // technique (linear vs dual-quaternion), and bone hierarchy: a
+        // mis-triangulated mesh (a real index-parsing bug connecting two
+        // vertices that shouldn't be connected, e.g. two different
+        // fingertips) would be invisible in a static bind-pose render if
+        // the wrongly-connected vertices happen to sit close together
+        // there, but would stretch into an obvious flat panel once the
+        // bones actually separate during animation - and would look
+        // identical under any skinning technique, since both just render
+        // whatever triangles exist, wrong ones included.
+        for (size_t pi = 0; pi < result.meshParts.size(); ++pi) {
+            const auto& part = result.meshParts[pi];
+            for (size_t si = 0; si < part.submeshes.size(); ++si) {
+                const auto& sm = part.submeshes[si];
+                float maxEdge = 0.0f;
+                size_t maxEdgeTri = 0;
+                for (size_t t = 0; t + 2 < sm.indices.size(); t += 3) {
+                    uint32_t ia = sm.indices[t];
+                    uint32_t ib = sm.indices[t + 1];
+                    uint32_t ic = sm.indices[t + 2];
+                    if (ia >= sm.positions.size() || ib >= sm.positions.size() || ic >= sm.positions.size())
+                        continue;
+                    const auto& pa = sm.positions[ia];
+                    const auto& pb = sm.positions[ib];
+                    const auto& pc = sm.positions[ic];
+                    auto dist = [](const assets::Float3& x, const assets::Float3& y) {
+                        float dx = x.x - y.x, dy = x.y - y.y, dz = x.z - y.z;
+                        return std::sqrt(dx * dx + dy * dy + dz * dz);
+                    };
+                    float e = std::max({dist(pa, pb), dist(pb, pc), dist(pc, pa)});
+                    if (e > maxEdge) {
+                        maxEdge = e;
+                        maxEdgeTri = t / 3;
+                    }
+                }
+                std::cout << "[ANIMDBG] meshPart[" << pi << "] submesh[" << si << "] triCount="
+                           << (sm.indices.size() / 3) << " vertCount=" << sm.positions.size()
+                           << " maxBindEdgeLength=" << maxEdge << " (tri#" << maxEdgeTri << ")\n";
+            }
+        }
+        return result;
+    }
+
+    // Real .ans clip resolution, used lazily by runVisualizer()'s own clip
+    // cache - any archive this resolver already has open (including
+    // data_animation_00.tre, added Phase 21) may hold it.
+    std::optional<assets::AnimationClipData> resolveAnimationClip(const std::string& ansPath) {
+        auto bytes = tryExtract(ansPath);
+        if (!bytes.has_value()) return std::nullopt;
+        try {
+            return assets::AnimationClip::parse(*bytes);
+        } catch (const std::exception& e) {
+            std::cerr << "[ANIM] .ans parse failed for " << ansPath << ": " << e.what() << "\n";
+            return std::nullopt;
+        }
+    }
+
 private:
     struct NamedArchive {
         std::string name;
@@ -1118,6 +1333,22 @@ private:
     };
 
     std::optional<std::vector<uint8_t>> tryExtract(const std::string& name) {
+        // TEMPORARY debug override (Blender reweighting pipeline live test,
+        // 2026-07-24) - loads a single reworked .mgn from disk instead of
+        // the archived original, to visually verify a vertex-weight fix
+        // before deciding whether to ship it. Remove once verified.
+        if (name == "appearance/mesh/hum_m_hands_l0.mgn") {
+            std::ifstream f(
+                "C:\\Users\\lmad2\\AppData\\Local\\Temp\\claude\\c--SWG-Client-new-SWG-Client-New\\"
+                "4a3b024f-c467-4d32-9f86-ecf0bf94804d\\scratchpad\\mgn_work\\"
+                "hum_m_hands_l0_reweighted_v2.mgn",
+                std::ios::binary);
+            if (f) {
+                std::cout << "[DEBUG-OVERRIDE] loading reweighted " << name << " from disk\n";
+                return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
+                                             std::istreambuf_iterator<char>());
+            }
+        }
         for (auto& named : archives_) {
             if (named.archive.contains(name)) {
                 return named.archive.extract(name);
@@ -1129,6 +1360,47 @@ private:
     std::vector<NamedArchive> archives_;
     std::unordered_map<uint32_t, std::string> crcToTemplatePath_;
 };
+
+// Phase 21 (animation), v1 - small, explicitly extensible posture/
+// locomotion -> real .lat state name map. Real transition clips
+// (trn_standing_to_kneeling etc., confirmed present in the real state
+// table) are deliberately not wired up yet - hard cuts between states are
+// fine for v1, per explicit direction; swapping to something richer only
+// needs this function (plus playing a transition clip first) touched, not
+// a redesign. Real posture values per swgproto::PostureMessage.h's own
+// doc: 0=upright, 1=crouched, 2=prone, 3=sneaking, 8=sitting,
+// 9=skill-animating - postures 3/9 aren't mapped to a dedicated real state
+// yet, falling back to standing.
+const char* selfAnimationStateNameFor(uint8_t posture, bool isMoving) {
+    if (isMoving && posture == 0) {
+        // "loop_combat_standing" is a real SPAT-variant state whose own
+        // first real clip (appearance/animation/all_b_loc_walk_male.ans) is
+        // the walk cycle - confirmed via a real dump this session. Despite
+        // the "combat" name, the clip itself is generically named/usable
+        // for ordinary walking.
+        return "loop_combat_standing";
+    }
+    switch (posture) {
+        case 1: return "loop_kneeling";
+        case 2: return "loop_prone";
+        case 8: return "loop_sitting_chair";
+        default: return "loop_standing";
+    }
+}
+
+// Looks up `stateName`'s real FIRST clip path in `table` - a real, valid
+// clip for that state in every case checked this session (see
+// AnimationState::clipPaths' own comment on why "first" is a fine, real
+// choice for v1 rather than modeling every SPAT/SSAT variant's selection
+// logic). Empty string if the state isn't found or has no clips.
+std::string selfClipPathForState(const assets::AnimationStateTableData& table, const char* stateName) {
+    for (const auto& state : table.states) {
+        if (state.name == stateName && !state.clipPaths.empty()) {
+            return state.clipPaths[0];
+        }
+    }
+    return {};
+}
 
 // Resolves a real terrainName (from CmdStartScene, e.g. "terrain/naboo.trn")
 // into a real terrain::TerrainSource - real classic-planet .trn files live
@@ -2175,6 +2447,34 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     bool predictedSelfInitialized = false;
     uint64_t selfObjectId = 0;
 
+    // Phase 21 (animation) - promoted out of the WASD-handling block's own
+    // local `movementKeyHeld` (which resets every frame and isn't visible
+    // outside that block) into small persistent locomotion state so the
+    // draw loop's own animation state-selection (further down, same frame)
+    // can read this frame's movement intent.
+    bool selfIsMoving = false;
+
+    // Phase 21 (animation) - self-only real animation state (v1 scope, see
+    // SelfAnimationData's own comment on why other visible players/
+    // creatures still render bind-pose only this phase). Resolved once,
+    // synchronously, the first frame self's real objectCrc becomes known
+    // (see the draw loop below). `selfDynamicMeshes` holds one
+    // renderer::DynamicMeshHandle per real submesh across every resolved
+    // body part (flattened, parallel to iterating `animData->meshParts`
+    // then each part's own `submeshes`); `selfMeshBoneBindings` is the
+    // matching per-body-part bone-name binding (see
+    // animation::bindMeshBoneIndices). `selfClipCache` memoizes parsed real
+    // `.ans` clips by their real archive path, resolved lazily the first
+    // time a given clip is actually needed to animate self (avoids parsing
+    // all 664 real states' worth of clips up front for the handful this
+    // phase's small state map ever selects).
+    std::optional<SelfAnimationData> selfAnimData;
+    std::vector<std::vector<int>> selfMeshBoneBindings; // parallel to selfAnimData->meshParts
+    std::vector<renderer::DynamicMeshHandle> selfDynamicMeshes;
+    std::unordered_map<std::string, std::optional<assets::AnimationClipData>> selfClipCache;
+    float selfAnimTimeSeconds = 0.0f;
+    bool selfAnimResolveAttempted = false;
+
     // Phase 17 Step 4 - self's currently-tracked containing cell (0 =
     // outdoors/world-relative). Real capture evidence changed the original
     // plan here: rather than deriving floor height from resolved cell mesh
@@ -2264,7 +2564,17 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     std::cout << "\n[VISUALIZER] window open (1920x1080) - third-person camera locked to self, "
                  "hold the right mouse button to orbit, scroll wheel to zoom. Press 'I' to toggle "
                  "full-building inspection mode (free noclip camera, every cell of a building "
-                 "visible at once). Close the window to exit.\n";
+                 "visible at once). Press 'B' to toggle forcing self's animated skinning to the "
+                 "real bind pose only, 'V' to cycle the animated-rotation composition variant, "
+                 "'C' to cycle a real axis sign/swap correction, 'T' to toggle animated "
+                 "translation, 'N' to cycle the real QCHN bit-layout hypothesis, 'M' to cycle "
+                 "isolating a single real bone's animation, 'Z' to skip Z-negation for arm-chain "
+                 "bones, 'R' to skip Z-negation for the root bone, 'L' to cycle a forced "
+                 "dropped-axis override for leg-chain bones, 'F' to cycle the same override for "
+                 "the finger+elbow/wrist chain, 'G' to cycle a forced composition-variant override "
+                 "for that same chain, or 'H' to cycle a forced axis-fix-variant override for that "
+                 "same chain (Phase 21 diagnostics - widened 2026-07-23 to also cover "
+                 "forearm/ulna/wrist since they share the same artifact). Close the window to exit.\n";
 
     using Clock = std::chrono::steady_clock;
     auto lastFrameTime = Clock::now();
@@ -2292,6 +2602,14 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         float deltaSeconds = std::chrono::duration<float>(now - lastFrameTime).count();
         lastFrameTime = now;
 
+        // Phase 21 (animation) - real .ans clip playback time, treated
+        // directly as a frame-number clock (see animation::
+        // sampleLocalBoneTransforms's own comment: no real fps scalar has
+        // been decoded from a clip's own header yet, so 1 unit == 1 real
+        // keyframe "frame" field for now). Free-running/unbounded - each
+        // channel wraps independently by its own real keyframe range.
+        selfAnimTimeSeconds += deltaSeconds * 30.0f; // assumed ~30fps source data, needs live tuning
+
         // Phase 18 - one-shot edge-detected toggle (same technique as
         // leftMouseWasDown below), not held-key, so tapping 'I' doesn't
         // flip the mode 30 times/second. Seeds the fly camera's starting
@@ -2309,6 +2627,279 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
             std::cout << "[VISUALIZER] inspection mode " << (inspectionMode ? "ON" : "OFF") << "\n";
         }
         inspectKeyWasDown = inspectKeyDown;
+
+        // Phase 21 (animation) diagnostic - forces self's animated skinning
+        // to sample the real BIND pose only (no animation clip), isolating
+        // whether a visual bug is in the core skinning math (hierarchy
+        // composition, bone-weight binding, inverse-bind-pose) - which
+        // should reduce to visually reproducing the exact original
+        // unskinned mesh shape when forced this way - versus the animated-
+        // rotation sampling path (quaternion decode, pre/post-rotation
+        // composition). Kept as a permanent debug aid, not throwaway.
+        static bool forceBindPoseDebug = false;
+        static bool bindPoseKeyWasDown = false;
+        bool bindPoseKeyDown = renderer::Window::isKeyDown('B');
+        if (bindPoseKeyDown && !bindPoseKeyWasDown) {
+            forceBindPoseDebug = !forceBindPoseDebug;
+            std::cout << "[VISUALIZER] force bind-pose-only self skinning "
+                       << (forceBindPoseDebug ? "ON" : "OFF") << "\n";
+        }
+        bindPoseKeyWasDown = bindPoseKeyDown;
+
+        // Phase 21 (animation) diagnostic - cycles which real
+        // preRotation/postRotation + animated-rotation composition formula
+        // self's skinning uses (see animation::sampleLocalBoneTransforms's
+        // own comment on what each variant tests) - a real bug found live
+        // this session (bind pose correct, but animated legs collapsed
+        // while animated spine/root looked correct) means the right
+        // composition convention isn't confirmed yet. Kept as a permanent
+        // debug aid until it is.
+        static int selfRotationVariant = 0;
+        static bool variantKeyWasDown = false;
+        bool variantKeyDown = renderer::Window::isKeyDown('V');
+        if (variantKeyDown && !variantKeyWasDown) {
+            selfRotationVariant = (selfRotationVariant + 1) % 6;
+            std::cout << "[VISUALIZER] self rotation composition variant = " << selfRotationVariant
+                       << "\n";
+        }
+        variantKeyWasDown = variantKeyDown;
+
+        // Phase 21 (animation) diagnostic - cycles a real per-axis sign/
+        // swap correction applied to the decoded animated quaternion (see
+        // animation::sampleLocalBoneTransforms's own comment on
+        // `axisFixVariant`) - tried after all 4 'V' composition variants
+        // still looked wrong live, testing a coordinate-handedness
+        // mismatch between the real `.ans` data and DirectXMath instead.
+        // Real live A/B comparison this session (variant 3 vs variant 2)
+        // showed variant 3 (negate the decoded animated rotation's real Z
+        // component) clearly reconstructing a recognizable leg+foot shape
+        // - now baked directly into assets::AnimationClip's own decode
+        // (see its own comment), so this debug toggle defaults back to 0
+        // (no additional fix) rather than double-negating on top of it.
+        static int selfAxisFixVariant = 0;
+        static bool axisFixKeyWasDown = false;
+        bool axisFixKeyDown = renderer::Window::isKeyDown('C');
+        if (axisFixKeyDown && !axisFixKeyWasDown) {
+            selfAxisFixVariant = (selfAxisFixVariant + 1) % 7;
+            std::cout << "[VISUALIZER] self axis-fix variant = " << selfAxisFixVariant << "\n";
+        }
+        axisFixKeyWasDown = axisFixKeyDown;
+
+        // Phase 21 (animation) diagnostic - toggles ignoring real animated
+        // translation channels entirely (root is the only bone with one),
+        // isolating whether the real Y-extent collapse found live traces
+        // to translation specifically, separate from rotation.
+        static bool disableAnimTranslationDebug = false;
+        static bool translationKeyWasDown = false;
+        bool translationKeyDown = renderer::Window::isKeyDown('T');
+        if (translationKeyDown && !translationKeyWasDown) {
+            disableAnimTranslationDebug = !disableAnimTranslationDebug;
+            std::cout << "[VISUALIZER] disable self animated translation "
+                       << (disableAnimTranslationDebug ? "ON" : "OFF") << "\n";
+        }
+        translationKeyWasDown = translationKeyDown;
+
+        // Phase 21 (animation) diagnostic - toggles which real QCHN
+        // bit-layout hypothesis assets::AnimationClip's own decoder uses
+        // (see assets::AnimationClip::setBitLayoutVariantForTesting's own
+        // comment) - the two candidates are statistically almost tied on
+        // real aggregate validity (a 57-file, 75k-keyframe real sample),
+        // so this needs a real live visual A/B, not just that metric.
+        // Clears the clip cache so already-resolved clips get re-parsed
+        // with the new layout instead of serving stale decoded data.
+        static int selfBitLayoutVariant = 2;
+        static bool bitLayoutKeyWasDown = false;
+        bool bitLayoutKeyDown = renderer::Window::isKeyDown('N');
+        if (bitLayoutKeyDown && !bitLayoutKeyWasDown) {
+            selfBitLayoutVariant = (selfBitLayoutVariant + 1) % 3;
+            assets::AnimationClip::setBitLayoutVariantForTesting(selfBitLayoutVariant);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self QCHN bit-layout variant = " << selfBitLayoutVariant
+                       << " (clip cache cleared)\n";
+        }
+        bitLayoutKeyWasDown = bitLayoutKeyDown;
+
+        // Phase 21 (animation) diagnostic - toggles skipping the
+        // Z-negation (see AnimationClip.cpp's own comment) for arm-chain
+        // bones only, since it was found/validated using leg motion and
+        // arms have been the single most consistently malformed bone group
+        // in every diagnostic tonight, confirmed live via RenderDoc to be
+        // the very first submesh that renders malformed. Clears the clip
+        // cache so already-resolved clips get re-parsed.
+        static bool selfSkipZNegationForArms = false;
+        static bool armZKeyWasDown = false;
+        bool armZKeyDown = renderer::Window::isKeyDown('Z');
+        if (armZKeyDown && !armZKeyWasDown) {
+            selfSkipZNegationForArms = !selfSkipZNegationForArms;
+            assets::AnimationClip::setSkipZNegationForArmsForTesting(selfSkipZNegationForArms);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self skip-Z-negation-for-arms = "
+                       << (selfSkipZNegationForArms ? "ON" : "OFF") << " (clip cache cleared)\n";
+        }
+        armZKeyWasDown = armZKeyDown;
+
+        // Phase 21 (animation) diagnostic - same idea as the 'Z' key above
+        // but for the `root` bone specifically, since root is the one bone
+        // whose own decoded rotation directly IS the whole body's world
+        // orientation (no parent to isolate the error to a single limb) -
+        // live evidence (self flipping/twisting while walking, animated;
+        // stable while walking in forced bind pose) isolates the remaining
+        // problem to the walk clip's decoded rotation data, and root is the
+        // prime suspect for a whole-body flip. Clears the clip cache so
+        // already-resolved clips get re-parsed.
+        static bool selfSkipZNegationForRoot = false;
+        static bool rootRKeyWasDown = false;
+        bool rootRKeyDown = renderer::Window::isKeyDown('R');
+        if (rootRKeyDown && !rootRKeyWasDown) {
+            selfSkipZNegationForRoot = !selfSkipZNegationForRoot;
+            assets::AnimationClip::setSkipZNegationForRootForTesting(selfSkipZNegationForRoot);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self skip-Z-negation-for-root = "
+                       << (selfSkipZNegationForRoot ? "ON" : "OFF") << " (clip cache cleared)\n";
+        }
+        rootRKeyWasDown = rootRKeyDown;
+
+        // Phase 21 (animation) diagnostic - bit-layout variant 2's
+        // "always drop w" rule fixed the whole-body orientation and most
+        // limbs live, but legs specifically still show real artifacts
+        // (flat "sail" triangles, twisting) even with that fix - cycles
+        // leg-chain bones (lthigh/lshin/lankle/ltoe + r* counterparts)
+        // through forcing a DIFFERENT fixed dropped axis (off -> x -> y ->
+        // z -> w -> off...) to empirically find the real one. Clears the
+        // clip cache so already-resolved clips get re-parsed.
+        static int selfLegForcedDropIndex = -1;
+        static bool legLKeyWasDown = false;
+        bool legLKeyDown = renderer::Window::isKeyDown('L');
+        if (legLKeyDown && !legLKeyWasDown) {
+            selfLegForcedDropIndex = selfLegForcedDropIndex + 1 >= 4 ? -1 : selfLegForcedDropIndex + 1;
+            assets::AnimationClip::setLegForcedDropIndexForTesting(selfLegForcedDropIndex);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self leg-forced-drop-index = " << selfLegForcedDropIndex
+                       << " (-1=off/normal always-w, clip cache cleared)\n";
+        }
+        legLKeyWasDown = legLKeyDown;
+
+        // Phase 21 (animation) diagnostic - same idea as the 'L' key above
+        // but for finger bones (thumb/index/ring). Live evidence: fingers
+        // still show a flat "sail" artifact even with the real extracted
+        // base/scale tables and correctly-formed everything else; extending
+        // the arm-chain Z-negation fix to fingers gave a negative result
+        // (flipped the artifact's direction rather than fixing it), ruling
+        // out a simple sign issue but not a different fixed dropped axis.
+        // Cycles finger-chain bones through forcing a different fixed
+        // dropped axis (off -> x -> y -> z -> w -> off...). Clears the
+        // clip cache so already-resolved clips get re-parsed.
+        static int selfFingerForcedDropIndex = -1;
+        static bool fingerFKeyWasDown = false;
+        bool fingerFKeyDown = renderer::Window::isKeyDown('F');
+        if (fingerFKeyDown && !fingerFKeyWasDown) {
+            selfFingerForcedDropIndex = selfFingerForcedDropIndex + 1 >= 4 ? -1 : selfFingerForcedDropIndex + 1;
+            assets::AnimationClip::setFingerForcedDropIndexForTesting(selfFingerForcedDropIndex);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self finger-forced-drop-index = " << selfFingerForcedDropIndex
+                       << " (-1=off/normal always-w, clip cache cleared)\n";
+        }
+        fingerFKeyWasDown = fingerFKeyDown;
+
+        // Phase 21 (animation) diagnostic - live evidence (2026-07-22):
+        // finger bones still show a flat "sail" artifact even after ruling
+        // out bind pose (checked live, clean) and per-keyframe decode math
+        // (checked offline against real bytes, sane) as the cause - leaving
+        // rotation COMPOSITION as the remaining suspect, since fingers sit
+        // at the deepest point in the whole skeleton hierarchy. Cycles
+        // finger-chain bones (widened 2026-07-23 to also cover
+        // forearm/ulna/wrist - see animation::isFingerChainBoneLocal's own
+        // comment) through forcing a different composition variant than
+        // every other bone uses (off -> 0 -> 1 -> ... -> 5 -> off...).
+        // Clears the clip cache so already-resolved clips get re-parsed.
+        static int selfFingerCompositionVariant = -1;
+        static bool fingerGKeyWasDown = false;
+        bool fingerGKeyDown = renderer::Window::isKeyDown('G');
+        if (fingerGKeyDown && !fingerGKeyWasDown) {
+            selfFingerCompositionVariant = selfFingerCompositionVariant + 1 >= 6 ? -1 : selfFingerCompositionVariant + 1;
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self finger-composition-variant = " << selfFingerCompositionVariant
+                       << " (-1=off/normal, clip cache cleared)\n";
+        }
+        fingerGKeyWasDown = fingerGKeyDown;
+
+        // Phase 21 (animation) diagnostic - live evidence (2026-07-22):
+        // traced the finger "sail" down to a specific outlier triangle
+        // whose 3 bones' own world ORIGINS are individually reasonable,
+        // but whose mesh VERTICES (offset from those origins) end up
+        // wildly displaced - consistent with a vertex's own local offset
+        // being rotated in a subtly wrong axis/sign specifically for
+        // fingers, distinct from composition ORDER (already tried via 'G',
+        // no fix). Cycles finger-chain bones through forcing a different
+        // axisFixVariant (sign/swap correction on the raw animated
+        // rotation) than every other bone uses (off -> 0 -> 1 -> ... -> 6
+        // -> off...). Clears the clip cache so already-resolved clips get
+        // re-parsed.
+        static int selfFingerAxisFixVariant = -1;
+        static bool fingerHKeyWasDown = false;
+        bool fingerHKeyDown = renderer::Window::isKeyDown('H');
+        if (fingerHKeyDown && !fingerHKeyWasDown) {
+            selfFingerAxisFixVariant = selfFingerAxisFixVariant + 1 >= 7 ? -1 : selfFingerAxisFixVariant + 1;
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self finger-axis-fix-variant = " << selfFingerAxisFixVariant
+                       << " (-1=off/normal, clip cache cleared)\n";
+        }
+        fingerHKeyWasDown = fingerHKeyDown;
+
+        // Phase 21 (animation) diagnostic - toggles the real three-term
+        // bind-pose formula found by reading the leaked original client
+        // source (see animation::sampleLocalBoneTransforms's own comment on
+        // `useRealBindPoseFormula`) - bypasses every 'V'/'C'/'G'/'H' variant
+        // above entirely when on. Defaults OFF; current live rendering is
+        // completely unaffected until this key is pressed.
+        static bool selfUseRealBindPoseFormula = false;
+        static bool realBindPoseKeyWasDown = false;
+        bool realBindPoseKeyDown = renderer::Window::isKeyDown('U');
+        if (realBindPoseKeyDown && !realBindPoseKeyWasDown) {
+            selfUseRealBindPoseFormula = !selfUseRealBindPoseFormula;
+            std::cout << "[VISUALIZER] self use-real-bind-pose-formula = "
+                       << (selfUseRealBindPoseFormula ? "ON" : "OFF") << "\n";
+        }
+        realBindPoseKeyWasDown = realBindPoseKeyDown;
+
+        // Phase 21 (animation) diagnostic - cycles through a real bone
+        // chain, CUMULATIVELY adding one more bone's real animated
+        // rotation/translation each press (every bone not yet added stays
+        // forced to real bind pose - see animation::
+        // sampleLocalBoneTransforms's own comment on `isolateBoneNames`).
+        // Added after the full clip (every bone animated at once) kept
+        // looking badly broken live despite bind pose being perfect, AND
+        // both `root` alone and `root+spine1` alone looked clean/coherent
+        // in isolation - this builds the chain up further (spine, then a
+        // leg, then an arm) to find exactly where multiple real
+        // simultaneously-animated bones start compounding into a visibly
+        // broken result. Cycle index 0 = empty (normal, every bone
+        // animates).
+        static const char* kIsolateBoneChain[] = {
+            "root",   "spine1", "spine2", "spine3", "neck",  "head",
+            "lThigh", "lShin",  "lAnkle", "ltoe",   "lClav", "lArm",
+            "lForeArm", "lUlna", "lWrist",
+        };
+        static constexpr int kIsolateBoneChainLen =
+            static_cast<int>(sizeof(kIsolateBoneChain) / sizeof(kIsolateBoneChain[0]));
+        static int selfIsolateBoneCount = 0; // 0 = normal (empty set)
+        static bool isolateBoneKeyWasDown = false;
+        bool isolateBoneKeyDown = renderer::Window::isKeyDown('M');
+        if (isolateBoneKeyDown && !isolateBoneKeyWasDown) {
+            selfIsolateBoneCount = (selfIsolateBoneCount + 1) % (kIsolateBoneChainLen + 1);
+            if (selfIsolateBoneCount == 0) {
+                std::cout << "[VISUALIZER] self isolate-bones = (none, all bones animate)\n";
+            } else {
+                std::cout << "[VISUALIZER] self isolate-bones = ";
+                for (int bi = 0; bi < selfIsolateBoneCount; ++bi) {
+                    std::cout << kIsolateBoneChain[bi] << (bi + 1 < selfIsolateBoneCount ? "+" : "");
+                }
+                std::cout << "\n";
+            }
+        }
+        isolateBoneKeyWasDown = isolateBoneKeyDown;
+        std::vector<std::string> selfIsolateBoneNames(kIsolateBoneChain,
+                                                        kIsolateBoneChain + selfIsolateBoneCount);
 
         // One snapshot per frame, reused by every resolveWorldPosition() call
         // below (self-seeding, draw pass, label pass) - see
@@ -2393,6 +2984,7 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                 moveVec = DirectX::XMVectorSubtract(moveVec, rightVec);
                 movementKeyHeld = true;
             }
+            selfIsMoving = movementKeyHeld; // Phase 21 - persists past this block for animation state selection
 
             // Real collision (Phase 20) needs both the pre-move and
             // candidate post-move world position - captured here, before
@@ -2991,9 +3583,447 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                 const std::vector<renderer::MeshHandle>* realMesh = nullptr;
                 const std::vector<renderer::MeshHandle>* skeletalSubmeshes = nullptr;
                 const std::vector<CellHandles>* buildingCells = nullptr;
+                bool drewAnimatedSelf = false;
                 if (obj.typeTag == worldmodel::ObjectTypeTag::Creature ||
                     obj.typeTag == worldmodel::ObjectTypeTag::Player) {
-                    skeletalSubmeshes = skeletalMeshCache.get(obj.objectCrc, assetWorker);
+                    // Phase 21 (animation), v1 self-only - resolved once,
+                    // synchronously, the first time self's real objectCrc is
+                    // seen here (see SelfAnimationData's own comment on the
+                    // deliberate self-only scope cut - extending this to
+                    // other visible creatures/players is a real, natural
+                    // follow-up: give them the same treatment
+                    // AssetWorkerThread already gives skeletalMeshCache,
+                    // just async instead of this one-shot synchronous
+                    // call). A resolution failure (no real skeleton/mesh
+                    // data for this template) permanently falls back to the
+                    // existing bind-pose skeletalMeshCache path for self
+                    // too - same graceful degradation as every other
+                    // resolver here.
+                    if (obj.isSelf && !selfAnimResolveAttempted) {
+                        selfAnimResolveAttempted = true;
+                        selfAnimData = skeletalMeshResolver.resolveSelfAnimationData(obj.objectCrc);
+                        if (selfAnimData.has_value() && !selfAnimData->meshParts.empty()) {
+                            selfMeshBoneBindings.clear();
+                            selfDynamicMeshes.clear();
+                            for (size_t pi = 0; pi < selfAnimData->meshParts.size(); ++pi) {
+                                const auto& part = selfAnimData->meshParts[pi];
+                                auto binding =
+                                    animation::bindMeshBoneIndices(selfAnimData->skeleton, part.boneNames);
+                                // Phase 21 diagnostic - which mesh-bone index
+                                // each skeleton bone resolved to (-1 =
+                                // unmapped), to directly confirm mesh-to-
+                                // skeleton binding for leg bones specifically.
+                                std::cout << "[ANIMDBG] meshPart[" << pi << "] skeleton->meshBone: ";
+                                for (size_t si = 0; si < selfAnimData->skeleton.bones.size(); ++si) {
+                                    std::cout << selfAnimData->skeleton.bones[si].name << "="
+                                               << binding[si] << " ";
+                                }
+                                std::cout << "\n";
+                                selfMeshBoneBindings.push_back(std::move(binding));
+                                for (const auto& submesh : part.submeshes) {
+                                    selfDynamicMeshes.push_back(gfx.allocateDynamicMesh(
+                                        submesh.positions.size(), submesh.indices.size()));
+                                }
+                                // Phase 21 live investigation - raw real
+                                // vertex bone-weight data has never been
+                                // independently checked tonight (only
+                                // rotation decode has) - dump a sample to
+                                // rule out garbage bone indices or weights
+                                // not summing near 1.0 as the real cause of
+                                // meshPart[0]'s (arms) malformed shape.
+                                std::cout << "[ANIMDBG] meshPart[" << pi << "] boneNames.size()="
+                                           << part.boneNames.size() << " vertexWeights.size()="
+                                           << part.vertexWeights.size() << "\n";
+                                for (size_t vi = 0; vi < part.vertexWeights.size() && vi < 15; ++vi) {
+                                    std::cout << "[ANIMDBG]   vtx[" << vi << "] weights: ";
+                                    float sum = 0.0f;
+                                    for (const auto& bw : part.vertexWeights[vi]) {
+                                        std::cout << "(bone=" << bw.boneIndex << " w=" << bw.weight << ") ";
+                                        sum += bw.weight;
+                                    }
+                                    std::cout << " sum=" << sum << "\n";
+                                }
+                            }
+                        } else {
+                            selfAnimData.reset();
+                        }
+                    }
+
+                    if (obj.isSelf && selfAnimData.has_value() && !selfAnimData->meshParts.empty()) {
+                        uint8_t posture = 0;
+                        if constexpr (std::is_same_v<T, worldmodel::CreatureObject>) {
+                            if (obj.base3.has_value()) posture = obj.base3->posture;
+                        }
+                        const char* stateName = selfAnimationStateNameFor(posture, selfIsMoving);
+
+                        if (!selfAnimData->stateTable.states.empty()) {
+                            auto cacheIt = selfClipCache.find(stateName);
+                            if (cacheIt == selfClipCache.end()) {
+                                std::string clipPath =
+                                    selfClipPathForState(selfAnimData->stateTable, stateName);
+                                std::cout << "[ANIMDBG] resolved clip for state=" << stateName << ": "
+                                           << clipPath << "\n";
+                                std::optional<assets::AnimationClipData> clip;
+                                if (!clipPath.empty()) {
+                                    clip = skeletalMeshResolver.resolveAnimationClip(clipPath);
+                                }
+                                cacheIt = selfClipCache.emplace(stateName, std::move(clip)).first;
+                            }
+                            const assets::AnimationClipData* clip =
+                                (cacheIt->second.has_value() && !forceBindPoseDebug)
+                                    ? &cacheIt->second.value()
+                                    : nullptr;
+
+                            std::vector<int> clipBoneIndices;
+                            if (clip != nullptr) {
+                                clipBoneIndices =
+                                    animation::bindClipBoneIndices(selfAnimData->skeleton, *clip);
+                            }
+                            auto localTransforms = animation::sampleLocalBoneTransforms(
+                                selfAnimData->skeleton, clip, clipBoneIndices, selfAnimTimeSeconds,
+                                selfRotationVariant, selfAxisFixVariant, disableAnimTranslationDebug,
+                                &selfIsolateBoneNames, selfFingerCompositionVariant, selfFingerAxisFixVariant,
+                                selfUseRealBindPoseFormula);
+                            auto worldTransforms =
+                                animation::computeWorldBoneTransforms(selfAnimData->skeleton, localTransforms);
+
+                            // Phase 21 diagnostic - throttled dump of a
+                            // couple of named bones' real animated state
+                            // (which clip channel they resolved to, how
+                            // many real keyframes it has, the decoded
+                            // quaternion, and the resulting world
+                            // position) to compare a bone that visually
+                            // looks broken (lthigh) against one that
+                            // looks correct (spine1) without needing
+                            // another screenshot cycle.
+                            {
+                                static float lastLogTime = -1000.0f;
+                                if (selfAnimTimeSeconds - lastLogTime > 60.0f) { // ~2s at 30x scale
+                                    lastLogTime = selfAnimTimeSeconds;
+                                    auto dumpBone = [&](const char* name) {
+                                        for (size_t bi = 0; bi < selfAnimData->skeleton.bones.size(); ++bi) {
+                                            if (selfAnimData->skeleton.bones[bi].name != name) continue;
+                                            int clipIdx = (bi < clipBoneIndices.size()) ? clipBoneIndices[bi] : -1;
+                                            size_t kfCount = 0;
+                                            if (clip != nullptr && clipIdx >= 0 &&
+                                                static_cast<size_t>(clipIdx) < clip->bones.size()) {
+                                                kfCount = clip->bones[clipIdx].rotationKeyframes.size();
+                                            }
+                                            DirectX::XMFLOAT4X4 w;
+                                            DirectX::XMStoreFloat4x4(&w, worldTransforms[bi]);
+                                            DirectX::XMVECTOR q =
+                                                DirectX::XMQuaternionRotationMatrix(localTransforms[bi]);
+                                            DirectX::XMFLOAT4 qf;
+                                            DirectX::XMStoreFloat4(&qf, q);
+                                            std::cout << "[ANIMDBG] bone=" << name << " clipIdx=" << clipIdx
+                                                       << " keyframes=" << kfCount << " localQuat=(" << qf.x
+                                                       << "," << qf.y << "," << qf.z << "," << qf.w
+                                                       << ") worldPos=(" << w._41 << "," << w._42 << ","
+                                                       << w._43 << ")\n";
+                                            // Phase 21 diagnostic - the RAW
+                                            // real preRotation/postRotation/
+                                            // bindTranslation straight from
+                                            // the real .skt skeleton data,
+                                            // never directly inspected before
+                                            // (only ever seen already
+                                            // combined into a composed
+                                            // rotation) - added while
+                                            // chasing the finger "sail" down
+                                            // to whether one of these is
+                                            // itself anomalous (non-unit
+                                            // length, unexpectedly large)
+                                            // for finger bones specifically.
+                                            {
+                                                const auto& b = selfAnimData->skeleton.bones[bi];
+                                                float preLenSq = b.preRotation.x * b.preRotation.x +
+                                                                 b.preRotation.y * b.preRotation.y +
+                                                                 b.preRotation.z * b.preRotation.z +
+                                                                 b.preRotation.w * b.preRotation.w;
+                                                float postLenSq = b.postRotation.x * b.postRotation.x +
+                                                                  b.postRotation.y * b.postRotation.y +
+                                                                  b.postRotation.z * b.postRotation.z +
+                                                                  b.postRotation.w * b.postRotation.w;
+                                                std::cout << "[ANIMDBG]   preRot=(" << b.preRotation.x << ","
+                                                           << b.preRotation.y << "," << b.preRotation.z << ","
+                                                           << b.preRotation.w << ") len=" << std::sqrt(preLenSq)
+                                                           << " postRot=(" << b.postRotation.x << ","
+                                                           << b.postRotation.y << "," << b.postRotation.z << ","
+                                                           << b.postRotation.w << ") len=" << std::sqrt(postLenSq)
+                                                           << " bindTranslation=(" << b.bindTranslation.x << ","
+                                                           << b.bindTranslation.y << "," << b.bindTranslation.z
+                                                           << ")\n";
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    dumpBone("spine1");
+                                    dumpBone("lThigh");
+                                    dumpBone("rThigh");
+                                    dumpBone("root");
+                                    // Phase 21 diagnostic - added while chasing the
+                                    // real finger "sail" artifact down to a specific
+                                    // outlier triangle (lWrist/lRing01/lRing02) whose
+                                    // individual decoded rotations all checked out
+                                    // sane offline - dumping their real WORLD
+                                    // positions directly to see exactly which link
+                                    // in that 3-bone chain the real distance jump
+                                    // happens at.
+                                    dumpBone("lWrist");
+                                    dumpBone("lRing01");
+                                    dumpBone("lRing02");
+                                    dumpBone("lUlna");
+                                }
+                            }
+
+                            // Phase 21 diagnostic - throttle covers the
+                            // WHOLE per-part/per-submesh loop below (checked
+                            // once per frame here, not once per submesh),
+                            // so every body part gets logged together on the
+                            // same throttled frame instead of only the
+                            // first part encountered.
+                            static float lastVertLogTime = -1000.0f;
+                            // Threshold is in selfAnimTimeSeconds' own units,
+                            // which run at 30x real time (see its own
+                            // `+= deltaSeconds * 30.0f` update) - 15.0f here
+                            // is 0.5 REAL seconds, not 0.5 of this scaled
+                            // clock (an earlier version compared directly
+                            // against 0.5f, which is 0.5/30 = ~17ms of real
+                            // time - effectively unthrottled, and the real
+                            // cause of the console-spam complaint).
+                            bool shouldLogVertsThisFrame = selfAnimTimeSeconds - lastVertLogTime > 15.0f;
+                            if (shouldLogVertsThisFrame) {
+                                lastVertLogTime = selfAnimTimeSeconds;
+                            }
+
+                            size_t dynamicMeshIndex = 0;
+                            for (size_t partIndex = 0; partIndex < selfAnimData->meshParts.size();
+                                 ++partIndex) {
+                                const auto& part = selfAnimData->meshParts[partIndex];
+                                const auto& meshBoneIndices = selfMeshBoneBindings[partIndex];
+                                for (const auto& submesh : part.submeshes) {
+                                    if (dynamicMeshIndex >= selfDynamicMeshes.size()) break;
+                                    std::vector<assets::Float3> skinnedPositions;
+                                    std::vector<assets::Float3> skinnedNormals;
+                                    animation::skinSubmeshVertices(
+                                        submesh, part.vertexWeights, selfAnimData->skeleton,
+                                        meshBoneIndices, part.boneNames, worldTransforms,
+                                        skinnedPositions, skinnedNormals, selfUseRealBindPoseFormula);
+                                    // Phase 21 diagnostic - same idea as the
+                                    // real bind-pose-only triangle-edge check
+                                    // (AnimationVisualizerResolver's own
+                                    // comment), but on the real SKINNED
+                                    // (animated) positions instead - a
+                                    // mis-triangulated mesh (wrong vertices
+                                    // connected) would look fine in bind pose
+                                    // if those vertices happen to sit close
+                                    // together there, but should show up
+                                    // clearly here once bones have actually
+                                    // separated during animation. Throttled
+                                    // with the same flag as the bbox dump
+                                    // below.
+                                    if (shouldLogVertsThisFrame) {
+                                        float maxEdge = 0.0f;
+                                        size_t maxEdgeTri = 0;
+                                        for (size_t t = 0; t + 2 < submesh.indices.size(); t += 3) {
+                                            uint32_t ia = submesh.indices[t];
+                                            uint32_t ib = submesh.indices[t + 1];
+                                            uint32_t ic = submesh.indices[t + 2];
+                                            if (ia >= skinnedPositions.size() || ib >= skinnedPositions.size() ||
+                                                ic >= skinnedPositions.size())
+                                                continue;
+                                            const auto& pa = skinnedPositions[ia];
+                                            const auto& pb = skinnedPositions[ib];
+                                            const auto& pc = skinnedPositions[ic];
+                                            auto dist = [](const assets::Float3& x, const assets::Float3& y) {
+                                                float dx = x.x - y.x, dy = x.y - y.y, dz = x.z - y.z;
+                                                return std::sqrt(dx * dx + dy * dy + dz * dz);
+                                            };
+                                            float e = std::max({dist(pa, pb), dist(pb, pc), dist(pc, pa)});
+                                            if (e > maxEdge) {
+                                                maxEdge = e;
+                                                maxEdgeTri = t / 3;
+                                            }
+                                        }
+                                        std::cout << "[ANIMDBG] t=" << selfAnimTimeSeconds << " meshPart["
+                                                   << partIndex << "] SKINNED maxEdgeLength=" << maxEdge
+                                                   << " (tri#" << maxEdgeTri << ", indices="
+                                                   << (maxEdgeTri * 3 < submesh.indices.size()
+                                                           ? submesh.indices[maxEdgeTri * 3]
+                                                           : 0)
+                                                   << ","
+                                                   << (maxEdgeTri * 3 + 1 < submesh.indices.size()
+                                                           ? submesh.indices[maxEdgeTri * 3 + 1]
+                                                           : 0)
+                                                   << ","
+                                                   << (maxEdgeTri * 3 + 2 < submesh.indices.size()
+                                                           ? submesh.indices[maxEdgeTri * 3 + 2]
+                                                           : 0)
+                                                   << ")\n";
+                                        // Phase 21 diagnostic - real bone
+                                        // weights for the outlier triangle's
+                                        // 3 vertices, to directly confirm
+                                        // whether they're weighted to
+                                        // clearly different (non-adjacent)
+                                        // real bones - the smoking gun for a
+                                        // real mis-triangulated mesh vs. a
+                                        // transform-only bug.
+                                        if (maxEdge > 0.15f && maxEdgeTri * 3 + 2 < submesh.indices.size()) {
+                                            for (int corner = 0; corner < 3; ++corner) {
+                                                uint32_t vi = submesh.indices[maxEdgeTri * 3 + static_cast<size_t>(corner)];
+                                                uint32_t srcIdx = vi < submesh.sourceVertexIndices.size()
+                                                                      ? submesh.sourceVertexIndices[vi]
+                                                                      : 0;
+                                                std::cout << "[ANIMDBG]   outlier tri corner " << corner
+                                                           << " vertIdx=" << vi << " sourceIdx=" << srcIdx
+                                                           << " weights=";
+                                                if (srcIdx < part.vertexWeights.size()) {
+                                                    for (const auto& bw : part.vertexWeights[srcIdx]) {
+                                                        std::string bn = bw.boneIndex < part.boneNames.size()
+                                                                              ? part.boneNames[bw.boneIndex]
+                                                                              : "?";
+                                                        std::cout << "(" << bn << " w=" << bw.weight << ") ";
+                                                    }
+                                                }
+                                                std::cout << "\n";
+                                            }
+                                        }
+                                    }
+                                    // Phase 21 diagnostic - throttled bounding-box
+                                    // dump of the skinned result for the body
+                                    // part that contains legs (partIndex==1),
+                                    // to see whether positions are exploding
+                                    // to huge/NaN values (a math bug) or stay
+                                    // in a plausible range (a "wrong but
+                                    // bounded" pose - a different class of
+                                    // bug, e.g. triangle winding/indices).
+                                    {
+                                        if (shouldLogVertsThisFrame) {
+                                            float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f,
+                                                  minZ = 1e9f, maxZ = -1e9f;
+                                            for (const auto& p : skinnedPositions) {
+                                                minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+                                                minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+                                                minZ = std::min(minZ, p.z); maxZ = std::max(maxZ, p.z);
+                                            }
+                                            float uMinX = 1e9f, uMaxX = -1e9f, uMinY = 1e9f, uMaxY = -1e9f,
+                                                  uMinZ = 1e9f, uMaxZ = -1e9f;
+                                            for (const auto& p : submesh.positions) {
+                                                uMinX = std::min(uMinX, p.x); uMaxX = std::max(uMaxX, p.x);
+                                                uMinY = std::min(uMinY, p.y); uMaxY = std::max(uMaxY, p.y);
+                                                uMinZ = std::min(uMinZ, p.z); uMaxZ = std::max(uMaxZ, p.z);
+                                            }
+                                            float extentX = maxX - minX, extentY = maxY - minY,
+                                                  extentZ = maxZ - minZ;
+                                            float maxExtent = std::max({extentX, extentY, extentZ});
+                                            bool anomalous = maxExtent > 3.0f; // a real bind-pose body is ~2 units tall
+                                            std::cout << "[ANIMDBG] t=" << selfAnimTimeSeconds << " meshPart["
+                                                       << partIndex << "]" << (anomalous ? " *** ANOMALY ***" : "")
+                                                       << " skinned bbox: x=["
+                                                       << minX << "," << maxX << "] y=[" << minY << ","
+                                                       << maxY << "] z=[" << minZ << "," << maxZ
+                                                       << "] vertCount=" << skinnedPositions.size()
+                                                       << " | unskinned(bind) bbox: x=[" << uMinX << ","
+                                                       << uMaxX << "] y=[" << uMinY << "," << uMaxY
+                                                       << "] z=[" << uMinZ << "," << uMaxZ << "]\n";
+
+                                            // Phase 21 diagnostic - groups
+                                            // this submesh's vertices by
+                                            // their DOMINANT real bone
+                                            // (highest weight) and reports
+                                            // each bone's average real
+                                            // displacement (skinned minus
+                                            // bind position) - directly
+                                            // identifies WHICH specific bone
+                                            // is still causing bad geometry,
+                                            // rather than guessing by body
+                                            // region.
+                                            std::unordered_map<int, std::pair<float, int>> dispByMeshBone; // meshBoneIdx -> (sumDisp, count)
+                                            for (size_t vi = 0; vi < submesh.positions.size(); ++vi) {
+                                                uint32_t sourceIdx = vi < submesh.sourceVertexIndices.size()
+                                                                          ? submesh.sourceVertexIndices[vi]
+                                                                          : 0;
+                                                if (sourceIdx >= part.vertexWeights.size() ||
+                                                    part.vertexWeights[sourceIdx].empty()) {
+                                                    continue;
+                                                }
+                                                // dominant = highest-weight real BoneWeight for this vertex
+                                                const auto& weights = part.vertexWeights[sourceIdx];
+                                                int dominantMeshBone = static_cast<int>(weights[0].boneIndex);
+                                                float bestWeight = weights[0].weight;
+                                                for (const auto& bw : weights) {
+                                                    if (bw.weight > bestWeight) {
+                                                        bestWeight = bw.weight;
+                                                        dominantMeshBone = static_cast<int>(bw.boneIndex);
+                                                    }
+                                                }
+                                                float dx = skinnedPositions[vi].x - submesh.positions[vi].x;
+                                                float dy = skinnedPositions[vi].y - submesh.positions[vi].y;
+                                                float dz = skinnedPositions[vi].z - submesh.positions[vi].z;
+                                                float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
+                                                auto& entry = dispByMeshBone[dominantMeshBone];
+                                                entry.first += disp;
+                                                entry.second += 1;
+                                            }
+                                            std::cout << "[ANIMDBG]   per-bone avg displacement (meshPart["
+                                                       << partIndex << "]): ";
+                                            for (const auto& [meshBoneIdx, sumCount] : dispByMeshBone) {
+                                                std::string boneName = "?";
+                                                for (size_t si = 0; si < meshBoneIndices.size(); ++si) {
+                                                    if (meshBoneIndices[si] == meshBoneIdx) {
+                                                        boneName = selfAnimData->skeleton.bones[si].name;
+                                                        break;
+                                                    }
+                                                }
+                                                std::cout << boneName << "=" << (sumCount.first / sumCount.second)
+                                                           << "(n=" << sumCount.second << ") ";
+                                            }
+                                            std::cout << "\n";
+                                        }
+                                    }
+                                    assets::MeshData meshData;
+                                    meshData.positions = std::move(skinnedPositions);
+                                    meshData.normals = std::move(skinnedNormals);
+                                    meshData.uv0 = submesh.uv0;
+                                    meshData.indices = submesh.indices;
+                                    // Phase 21 live investigation - unthrottled
+                                    // (every call, not sampled) dump of exactly
+                                    // what's handed to the GPU for the FIRST
+                                    // several real calls this session, to
+                                    // remove any doubt about timing versus the
+                                    // throttled per-bone diagnostic above.
+                                    static int gpuHandoffLogCount = 0;
+                                    if (gpuHandoffLogCount < 60) {
+                                        ++gpuHandoffLogCount;
+                                        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f,
+                                              minZ = 1e9f, maxZ = -1e9f;
+                                        for (const auto& p : meshData.positions) {
+                                            minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+                                            minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+                                            minZ = std::min(minZ, p.z); maxZ = std::max(maxZ, p.z);
+                                        }
+                                        std::cout << "[ANIMDBG] GPU-HANDOFF #" << gpuHandoffLogCount
+                                                   << " t=" << selfAnimTimeSeconds << " partIndex=" << partIndex
+                                                   << " dynamicMeshIndex=" << dynamicMeshIndex
+                                                   << " objPos=(" << objPos.x << "," << objPos.y << "," << objPos.z
+                                                   << ") yaw=" << yawRadians
+                                                   << " vertCount=" << meshData.positions.size()
+                                                   << " idxCount=" << meshData.indices.size()
+                                                   << " bbox x=[" << minX << "," << maxX << "] y=[" << minY << ","
+                                                   << maxY << "] z=[" << minZ << "," << maxZ << "]\n";
+                                    }
+                                    gfx.updateDynamicMesh(selfDynamicMeshes[dynamicMeshIndex], meshData);
+                                    gfx.drawDynamicMesh(selfDynamicMeshes[dynamicMeshIndex], objPos,
+                                                         yawRadians, color);
+                                    ++dynamicMeshIndex;
+                                }
+                            }
+                        }
+                        drewAnimatedSelf = true;
+                    }
+
+                    if (!drewAnimatedSelf) {
+                        skeletalSubmeshes = skeletalMeshCache.get(obj.objectCrc, assetWorker);
+                    }
                 } else {
                     buildingCells = buildingCache.get(obj.objectCrc, assetWorker);
                     if (buildingCells == nullptr) {
@@ -3001,7 +4031,10 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     }
                 }
 
-                if (skeletalSubmeshes != nullptr) {
+                if (drewAnimatedSelf) {
+                    // Already drawn above via the CPU-skinned dynamic-mesh
+                    // path - nothing left to do for this object.
+                } else if (skeletalSubmeshes != nullptr) {
                     for (const auto& submeshHandle : *skeletalSubmeshes) {
                         gfx.drawMesh(submeshHandle, objPos, yawRadians, color);
                     }

@@ -29,10 +29,15 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
 
-    // Virtual-key code (VK_...) queried directly via GetAsyncKeyState - fine
-    // for a single-window, single-focus tool like this one.
+    // Virtual-key code (VK_...) queried via GetAsyncKeyState, gated on this
+    // window actually being the foreground/focused window (real bug found
+    // live: without this gate, typing in a completely different
+    // application that happened to contain one of this tool's single-letter
+    // debug toggle keys fired that toggle even with the game window
+    // unfocused).
     static bool isKeyDown(int virtualKeyCode);
-    // button: 0 = left, 1 = right, 2 = middle.
+    // button: 0 = left, 1 = right, 2 = middle. Same foreground-window gate
+    // as isKeyDown().
     static bool isMouseButtonDown(int button);
 
     // Mouse movement (in pixels) since the last call to this function -

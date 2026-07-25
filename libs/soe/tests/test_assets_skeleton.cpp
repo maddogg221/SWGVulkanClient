@@ -43,4 +43,15 @@ TEST_CASE("Skeleton: picks the highest-bone-count FORM SKTM block from a real .s
         float lengthSq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
         CHECK(lengthSq == doctest::Approx(1.0f).epsilon(0.01));
     }
+
+    // BPRO ('bindPoseRotation') - same sanity check, an independent check on
+    // its own byte offsets since it's read from a separate chunk than RPRE.
+    // See project memory project_animation_phase21_inprogress.md's "v3"
+    // section for why this chunk matters: it was real in every `.skt` file
+    // but silently unread by this project until 2026-07-25.
+    for (const auto& bone : skeleton.bones) {
+        const auto& q = bone.bindPoseRotation;
+        float lengthSq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        CHECK(lengthSq == doctest::Approx(1.0f).epsilon(0.01));
+    }
 }

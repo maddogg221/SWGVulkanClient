@@ -1,5 +1,6 @@
 #include <asio.hpp>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -17,7 +18,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "assets/AnimationClip.h"
 #include "assets/IffReader.h"
+#include "assets/Skeleton.h"
 #include "assets/TreArchive.h"
 #include "clientcommon/HexDump.h"
 #include "clientcommon/ObjControllerHandlers.h"
@@ -964,11 +967,35 @@ struct CliOptions {
     // override with --client-path on any other machine.
     std::string clientPath = "C:\\Program Files (x86)\\StarWarsGalaxies";
 
-    // TEMPORARY diagnostic (Phase 20 portal research) - dumps the real IFF
-    // chunk tree of a .pob file (path relative to data_other_00.tre, e.g.
-    // "appearance/ply_all_assoc_hall_civ_s01.pob") and exits, no networking.
-    // Remove once real portal geometry parsing is implemented/verified.
+    // General-purpose diagnostic (added Phase 20 for portal/floor-collision
+    // research, kept permanently) - dumps the real IFF chunk tree of ANY
+    // file inside data_other_00.tre (not just .pob despite the flag name),
+    // with hex payloads for small leaf chunks, and exits, no networking.
+    // Reusable for future format investigations.
     std::string dumpPobPath;
+
+    // General-purpose diagnostic (added Phase 21 for animation-format
+    // research) - lists every real file path across the same set of
+    // archives RealSkeletalMeshResolver opens whose path contains this
+    // substring, and exits, no networking. Case-sensitive substring match.
+    std::string listFilesSubstring;
+
+    // General-purpose diagnostic (added Phase 21 for animation-format
+    // research) - extracts one real file's raw bytes (searching the same
+    // archive set as --dump-pob) to a local file on disk, unmodified, for
+    // exact offline byte-level analysis (e.g. a Python script) where the
+    // hex/ASCII pretty-printer in dumpIffTree() isn't precise enough.
+    std::string extractRawPath;
+    std::string extractRawOutFile;
+
+    // SWG Blender toolkit bridge (2026-07-24) - dumps this project's own
+    // ALREADY-DECODED skeleton + animation clip data (not raw bytes) to a
+    // plain JSON file, so an independent renderer (Blender) can compose the
+    // same data without reimplementing the .skt/.ans byte-level decode a
+    // second time. See tools/swg_blender_toolkit/NOTES.md.
+    std::string dumpAnimSkeletonPath;
+    std::string dumpAnimClipPath;
+    std::string dumpAnimJsonOut;
 };
 
 CliOptions parseCommandLine(int argc, char** argv) {
@@ -1003,18 +1030,23 @@ CliOptions parseCommandLine(int argc, char** argv) {
         else if (arg == "--visualize") opts.visualize = true;
         else if (arg == "--client-path") opts.clientPath = next("--client-path");
         else if (arg == "--dump-pob") opts.dumpPobPath = next("--dump-pob");
+        else if (arg == "--list-files") opts.listFilesSubstring = next("--list-files");
+        else if (arg == "--extract-raw") opts.extractRawPath = next("--extract-raw");
+        else if (arg == "--extract-raw-out") opts.extractRawOutFile = next("--extract-raw-out");
+        else if (arg == "--dump-anim-skeleton") opts.dumpAnimSkeletonPath = next("--dump-anim-skeleton");
+        else if (arg == "--dump-anim-clip") opts.dumpAnimClipPath = next("--dump-anim-clip");
+        else if (arg == "--dump-anim-json-out") opts.dumpAnimJsonOut = next("--dump-anim-json-out");
     }
 
     return opts;
 }
 
-// TEMPORARY diagnostic (Phase 20 portal research) - prints the real IFF
-// chunk tree (tag, formType if a FORM, byte size, nesting depth) rooted at
-// `chunk`, and for any leaf chunk whose tag is "PRTL" or a FORM whose
-// formType is "PRTL", also hex-dumps its raw payload bytes so the real
-// portal-placement geometry format can be reverse-engineered by hand, the
-// same way this project's real CMSH/floor-collision format was discovered
-// earlier this session. Remove once real portal parsing lands.
+// General-purpose diagnostic (added Phase 20, kept permanently) - prints
+// the real IFF chunk tree (tag, formType if a FORM, byte size, nesting
+// depth) rooted at `chunk`, and for any small leaf chunk, also hex-dumps
+// its raw payload bytes (plus a printable-ASCII rendering alongside, for
+// spotting real embedded strings without decoding hex by hand) so an
+// unfamiliar format can be reverse-engineered directly from real bytes.
 void dumpIffTree(const assets::IffChunk& chunk, int depth) {
     auto tagToString = [](uint32_t tag) {
         std::string s(4, ' ');
@@ -1043,6 +1075,12 @@ void dumpIffTree(const assets::IffChunk& chunk, int depth) {
                        << " ";
         }
         std::cout << std::dec << std::setfill(' ') << "\n";
+        std::cout << indent << "  ascii: ";
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            uint8_t b = bytes.data()[i];
+            std::cout << (std::isprint(b) ? static_cast<char>(b) : '.');
+        }
+        std::cout << "\n";
     }
     for (const auto& child : chunk.children) {
         dumpIffTree(child, depth + 1);
@@ -1050,16 +1088,187 @@ void dumpIffTree(const assets::IffChunk& chunk, int depth) {
 }
 
 void runDumpPob(const CliOptions& opts) {
-    std::string archivePath = opts.clientPath + "\\data_other_00.tre";
-    assets::TreArchive archive(archivePath);
-    if (!archive.contains(opts.dumpPobPath)) {
-        std::cerr << "dump-pob: not found in archive: " << opts.dumpPobPath << "\n";
+    static const char* kArchiveNames[] = {
+        "data_other_00.tre",       "data_animation_00.tre",     "data_skeletal_mesh_00.tre",
+        "data_skeletal_mesh_01.tre", "data_static_mesh_00.tre", "data_static_mesh_01.tre",
+        "data_sku1_00.tre",        "data_sku1_01.tre",          "data_sku1_02.tre",
+        "data_sku1_03.tre",        "data_sku1_04.tre",          "data_sku1_05.tre",
+        "data_sku1_06.tre",        "data_sku1_07.tre",
+    };
+    for (const char* name : kArchiveNames) {
+        std::string archivePath = opts.clientPath + "\\" + name;
+        try {
+            assets::TreArchive archive(archivePath);
+            if (!archive.contains(opts.dumpPobPath)) {
+                continue;
+            }
+            std::cout << "(found in " << name << ")\n";
+            auto bytes = archive.extract(opts.dumpPobPath);
+            auto topLevel = assets::IffReader::parse(bytes);
+            for (const auto& chunk : topLevel) {
+                dumpIffTree(chunk, 0);
+            }
+            return;
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    std::cerr << "dump-pob: not found in any known archive: " << opts.dumpPobPath << "\n";
+}
+
+// General-purpose diagnostic (Phase 21 animation research) - same archive
+// search as runDumpPob(), but writes the extracted file's raw bytes to disk
+// unmodified instead of pretty-printing, for exact offline byte analysis.
+void runExtractRaw(const CliOptions& opts) {
+    static const char* kArchiveNames[] = {
+        "data_other_00.tre",       "data_animation_00.tre",     "data_skeletal_mesh_00.tre",
+        "data_skeletal_mesh_01.tre", "data_static_mesh_00.tre", "data_static_mesh_01.tre",
+        "data_sku1_00.tre",        "data_sku1_01.tre",          "data_sku1_02.tre",
+        "data_sku1_03.tre",        "data_sku1_04.tre",          "data_sku1_05.tre",
+        "data_sku1_06.tre",        "data_sku1_07.tre",
+    };
+    for (const char* name : kArchiveNames) {
+        std::string archivePath = opts.clientPath + "\\" + name;
+        try {
+            assets::TreArchive archive(archivePath);
+            if (!archive.contains(opts.extractRawPath)) {
+                continue;
+            }
+            auto bytes = archive.extract(opts.extractRawPath);
+            std::ofstream out(opts.extractRawOutFile, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            std::cout << "extract-raw: wrote " << bytes.size() << " bytes from " << name << " to "
+                      << opts.extractRawOutFile << "\n";
+            return;
+        } catch (const std::exception&) {
+            continue;
+        }
+    }
+    std::cerr << "extract-raw: not found in any known archive: " << opts.extractRawPath << "\n";
+}
+
+// Minimal JSON string escaper - real bone names checked this project are
+// plain ASCII identifiers, so this only needs to handle the couple of
+// characters that would actually break JSON syntax, not full Unicode
+// escaping.
+std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '"' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+// SWG Blender toolkit bridge (2026-07-24, see
+// tools/swg_blender_toolkit/NOTES.md) - dumps this project's own
+// ALREADY-DECODED skeleton (hierarchy + bind pose) and one animation clip's
+// ALREADY-DECODED per-bone keyframes to a plain JSON file. Deliberately
+// dumps decoded values, not raw bytes - the .skt/.ans byte-level parsing is
+// not in question, only the composition math applied afterward is, and
+// this lets an independent renderer (Blender) test exactly that without
+// reimplementing the byte-level decode a second time.
+void runDumpAnimJson(const CliOptions& opts) {
+    static const char* kArchiveNames[] = {
+        "data_other_00.tre",       "data_animation_00.tre",     "data_skeletal_mesh_00.tre",
+        "data_skeletal_mesh_01.tre", "data_sku1_00.tre",        "data_sku1_01.tre",
+        "data_sku1_02.tre",        "data_sku1_03.tre",          "data_sku1_04.tre",
+        "data_sku1_05.tre",        "data_sku1_06.tre",          "data_sku1_07.tre",
+    };
+    auto tryExtract = [&](const std::string& path) -> std::optional<std::vector<uint8_t>> {
+        for (const char* name : kArchiveNames) {
+            std::string archivePath = opts.clientPath + "\\" + name;
+            try {
+                assets::TreArchive archive(archivePath);
+                if (archive.contains(path)) {
+                    return archive.extract(path);
+                }
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto skeletonBytes = tryExtract(opts.dumpAnimSkeletonPath);
+    if (!skeletonBytes.has_value()) {
+        std::cerr << "dump-anim-json: skeleton not found: " << opts.dumpAnimSkeletonPath << "\n";
         return;
     }
-    auto bytes = archive.extract(opts.dumpPobPath);
-    auto topLevel = assets::IffReader::parse(bytes);
-    for (const auto& chunk : topLevel) {
-        dumpIffTree(chunk, 0);
+    auto clipBytes = tryExtract(opts.dumpAnimClipPath);
+    if (!clipBytes.has_value()) {
+        std::cerr << "dump-anim-json: clip not found: " << opts.dumpAnimClipPath << "\n";
+        return;
+    }
+
+    assets::SkeletonData skeleton;
+    assets::AnimationClipData clip;
+    try {
+        skeleton = assets::Skeleton::parse(*skeletonBytes);
+        clip = assets::AnimationClip::parse(*clipBytes);
+    } catch (const std::exception& e) {
+        std::cerr << "dump-anim-json: parse failed: " << e.what() << "\n";
+        return;
+    }
+
+    std::ofstream out(opts.dumpAnimJsonOut);
+    out << "{\n";
+    out << "  \"skeletonPath\": \"" << jsonEscape(opts.dumpAnimSkeletonPath) << "\",\n";
+    out << "  \"clipPath\": \"" << jsonEscape(opts.dumpAnimClipPath) << "\",\n";
+    out << "  \"bones\": [\n";
+    for (size_t i = 0; i < skeleton.bones.size(); ++i) {
+        const auto& b = skeleton.bones[i];
+        out << "    {\"name\": \"" << jsonEscape(b.name) << "\", \"parentIndex\": " << b.parentIndex
+            << ", \"preRotation\": [" << b.preRotation.x << ", " << b.preRotation.y << ", "
+            << b.preRotation.z << ", " << b.preRotation.w << "], \"postRotation\": ["
+            << b.postRotation.x << ", " << b.postRotation.y << ", " << b.postRotation.z << ", "
+            << b.postRotation.w << "], \"bindTranslation\": [" << b.bindTranslation.x << ", "
+            << b.bindTranslation.y << ", " << b.bindTranslation.z << "]}";
+        out << (i + 1 < skeleton.bones.size() ? ",\n" : "\n");
+    }
+    out << "  ],\n";
+    out << "  \"clipBones\": [\n";
+    for (size_t i = 0; i < clip.bones.size(); ++i) {
+        const auto& cb = clip.bones[i];
+        out << "    {\"boneName\": \"" << jsonEscape(cb.boneName) << "\", \"rotationKeyframes\": [\n";
+        for (size_t k = 0; k < cb.rotationKeyframes.size(); ++k) {
+            const auto& kf = cb.rotationKeyframes[k];
+            out << "      {\"frame\": " << kf.frame << ", \"rotation\": [" << kf.rotation.x << ", "
+                << kf.rotation.y << ", " << kf.rotation.z << ", " << kf.rotation.w << "]}";
+            out << (k + 1 < cb.rotationKeyframes.size() ? ",\n" : "\n");
+        }
+        out << "    ]}";
+        out << (i + 1 < clip.bones.size() ? ",\n" : "\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
+    std::cout << "dump-anim-json: wrote " << skeleton.bones.size() << " skeleton bones, "
+               << clip.bones.size() << " animated clip bones to " << opts.dumpAnimJsonOut << "\n";
+}
+
+// General-purpose diagnostic (Phase 21 animation research) - lists every
+// real file path across the same archive set RealSkeletalMeshResolver
+// opens whose path contains opts.listFilesSubstring, then exits.
+void runListFiles(const CliOptions& opts) {
+    static const char* kArchiveNames[] = {
+        "data_other_00.tre",       "data_animation_00.tre",     "data_skeletal_mesh_00.tre",
+        "data_skeletal_mesh_01.tre", "data_sku1_00.tre",        "data_sku1_01.tre",
+        "data_sku1_02.tre",        "data_sku1_03.tre",          "data_sku1_04.tre",
+        "data_sku1_05.tre",        "data_sku1_06.tre",          "data_sku1_07.tre",
+    };
+    for (const char* name : kArchiveNames) {
+        std::string archivePath = opts.clientPath + "\\" + name;
+        try {
+            assets::TreArchive archive(archivePath);
+            for (const auto& file : archive.listFiles()) {
+                if (file.find(opts.listFilesSubstring) != std::string::npos) {
+                    std::cout << name << ": " << file << "\n";
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "list-files: failed to open " << name << ": " << e.what() << "\n";
+        }
     }
 }
 
@@ -1364,6 +1573,18 @@ int main(int argc, char** argv) {
 
         if (!opts.dumpPobPath.empty()) {
             runDumpPob(opts);
+            return 0;
+        }
+        if (!opts.listFilesSubstring.empty()) {
+            runListFiles(opts);
+            return 0;
+        }
+        if (!opts.extractRawPath.empty()) {
+            runExtractRaw(opts);
+            return 0;
+        }
+        if (!opts.dumpAnimSkeletonPath.empty() && !opts.dumpAnimClipPath.empty()) {
+            runDumpAnimJson(opts);
             return 0;
         }
 

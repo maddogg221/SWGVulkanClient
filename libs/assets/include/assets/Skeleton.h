@@ -20,14 +20,15 @@ struct SkeletonBone {
     int32_t parentIndex = -1; // -1 = root
     Quaternion preRotation;
     Quaternion postRotation;
+    Quaternion bindPoseRotation; // 'BPRO' - see Skeleton.cpp's own comment
     Float3 bindTranslation;
 };
 
 // Plain, renderer-agnostic bind-pose skeleton data. Deliberately excludes
-// `BPRO`/`JROR` (real chunks present in every `.skt` file, but whose
-// semantics haven't been needed/decoded yet - see Skeleton.cpp's own
-// comment) since bind-pose rendering only needs per-bone parent index +
-// translation + orientation.
+// `JROR` (a real chunk present in every `.skt` file - a per-bone Euler
+// rotation-order enum, per the leaked original MayaExporter source; not
+// needed since this project only ever composes bones as quaternions, never
+// decomposes to/from Euler angles).
 struct SkeletonData {
     std::vector<SkeletonBone> bones;
 };

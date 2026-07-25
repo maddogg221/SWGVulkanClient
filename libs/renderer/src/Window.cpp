@@ -8,7 +8,21 @@ namespace renderer {
 
 namespace {
 constexpr wchar_t kWindowClassName[] = L"SwgVisualizerWindowClass";
-}
+
+// Real bug found live: isKeyDown()/isMouseButtonDown() are static (queried
+// from all over the codebase without a Window instance in hand) and used
+// GetAsyncKeyState() directly, which is a SYSTEM-WIDE key state, not scoped
+// to this window having focus - typing a message in a completely different
+// application (this tool's own AI chat client, in the real case that found
+// this) that happened to contain one of this project's single-letter debug
+// toggle keys (e.g. 'R') fired that toggle even though the game window
+// never had focus, corrupting an in-progress live test. Tracked here as a
+// plain HWND (this tool only ever constructs one Window - see the class's
+// own header comment) rather than adding it to the Window instance itself,
+// since isKeyDown() is called as a static from many places with no Window&
+// available.
+HWND g_focusHwnd = nullptr;
+} // namespace
 
 LRESULT CALLBACK Window::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     Window* self = reinterpret_cast<Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -80,9 +94,14 @@ Window::Window(int width, int height, const wchar_t* title) : width_(width), hei
 
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
+
+    g_focusHwnd = hwnd_;
 }
 
 Window::~Window() {
+    if (g_focusHwnd == hwnd_) {
+        g_focusHwnd = nullptr;
+    }
     if (hwnd_ != nullptr) {
         DestroyWindow(hwnd_);
     }
@@ -102,10 +121,12 @@ bool Window::pumpMessages() {
 }
 
 bool Window::isKeyDown(int virtualKeyCode) {
+    if (GetForegroundWindow() != g_focusHwnd) return false;
     return (GetAsyncKeyState(virtualKeyCode) & 0x8000) != 0;
 }
 
 bool Window::isMouseButtonDown(int button) {
+    if (GetForegroundWindow() != g_focusHwnd) return false;
     int vk = (button == 0) ? VK_LBUTTON : (button == 1) ? VK_RBUTTON : VK_MBUTTON;
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }

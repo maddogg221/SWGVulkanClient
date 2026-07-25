@@ -15,6 +15,15 @@ constexpr uint32_t kPrntTag = 0x50524E54; // 'PRNT'
 constexpr uint32_t kRpreTag = 0x52505245; // 'RPRE'
 constexpr uint32_t kRpstTag = 0x52505354; // 'RPST'
 constexpr uint32_t kBptrTag = 0x42505452; // 'BPTR'
+// 'BPRO' - per-bone "bind pose rotation" quaternion, same
+// insertChunkFloatQuaternion() encoding as RPRE/RPST (confirmed directly
+// against the leaked original SkeletonTemplateWriter.cpp source).
+// The real client composes a bone's bind-pose-relative local rotation as
+// `postRotation * (bindPoseRotation * preRotation)` (three terms), not the
+// `preRotation * postRotation` two-term approximation this project used
+// before discovering this chunk - every real `.skt` file has always
+// carried this data; it was simply never read.
+constexpr uint32_t kBproTag = 0x4250524F; // 'BPRO'
 
 } // namespace
 
@@ -51,8 +60,9 @@ SkeletonData Skeleton::parse(const std::vector<uint8_t>& bytes) {
     const IffChunk* rpreChunk = findFirstChunk(*best, kRpreTag);
     const IffChunk* rpstChunk = findFirstChunk(*best, kRpstTag);
     const IffChunk* bptrChunk = findFirstChunk(*best, kBptrTag);
+    const IffChunk* bproChunk = findFirstChunk(*best, kBproTag);
     if (nameChunk == nullptr || prntChunk == nullptr || rpreChunk == nullptr ||
-        rpstChunk == nullptr || bptrChunk == nullptr) {
+        rpstChunk == nullptr || bptrChunk == nullptr || bproChunk == nullptr) {
         throw std::runtime_error("Skeleton::parse: missing a required bone-data chunk");
     }
 
@@ -74,6 +84,8 @@ SkeletonData Skeleton::parse(const std::vector<uint8_t>& bytes) {
     rpstBuf.resetReadCursor();
     soe::PacketBuffer bptrBuf = bptrChunk->data;
     bptrBuf.resetReadCursor();
+    soe::PacketBuffer bproBuf = bproChunk->data;
+    bproBuf.resetReadCursor();
 
     SkeletonData result;
     result.bones.reserve(boneCount);
@@ -81,17 +93,28 @@ SkeletonData Skeleton::parse(const std::vector<uint8_t>& bytes) {
         SkeletonBone bone;
         bone.name = names[i];
         bone.parentIndex = static_cast<int32_t>(prntBuf.readUint32());
+        // Real write order (confirmed directly against the leaked original
+        // Iff::insertChunkFloatQuaternion source, 2026-07-25): scalar (w)
+        // FIRST, then x,y,z - NOT x,y,z,w. This project's own existing
+        // unit-length sanity test never caught the previous x,y,z,w
+        // reading being wrong since magnitude is order-invariant; the real
+        // writer source is unambiguous. `bindTranslation` is a plain
+        // Vector (insertChunkFloatVector: x,y,z, no w) and is unaffected.
+        bone.preRotation.w = rpreBuf.readFloat();
         bone.preRotation.x = rpreBuf.readFloat();
         bone.preRotation.y = rpreBuf.readFloat();
         bone.preRotation.z = rpreBuf.readFloat();
-        bone.preRotation.w = rpreBuf.readFloat();
+        bone.postRotation.w = rpstBuf.readFloat();
         bone.postRotation.x = rpstBuf.readFloat();
         bone.postRotation.y = rpstBuf.readFloat();
         bone.postRotation.z = rpstBuf.readFloat();
-        bone.postRotation.w = rpstBuf.readFloat();
         bone.bindTranslation.x = bptrBuf.readFloat();
         bone.bindTranslation.y = bptrBuf.readFloat();
         bone.bindTranslation.z = bptrBuf.readFloat();
+        bone.bindPoseRotation.w = bproBuf.readFloat();
+        bone.bindPoseRotation.x = bproBuf.readFloat();
+        bone.bindPoseRotation.y = bproBuf.readFloat();
+        bone.bindPoseRotation.z = bproBuf.readFloat();
         result.bones.push_back(bone);
     }
     return result;
