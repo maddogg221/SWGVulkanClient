@@ -110,6 +110,7 @@ if(WIN32)
     )
     FetchContent_MakeAvailable(vma)
 
+    add_subdirectory(libs/animation)
     add_subdirectory(libs/renderer)
 endif()
 add_subdirectory(tools/dummyclient)

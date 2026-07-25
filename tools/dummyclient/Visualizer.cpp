@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -992,6 +993,14 @@ struct SelfAnimationData {
     assets::SkeletonData skeleton;
     std::vector<AnimatedMeshPart> meshParts;
     assets::AnimationStateTableData stateTable; // real states, empty if resolution failed/no LATX
+    // Real gender, derived directly from self's own resolved template path
+    // (e.g. "object/creature/player/shared_zabrak_male.iff" - every real
+    // player template path checked this session carries a literal
+    // "_male"/"_female" suffix) - "male"/"female", or empty if neither
+    // marker is present (falls back to the real animation state table's
+    // own first gender branch, see AnimationStateTable.h's own comment on
+    // AnimationSelectionContext).
+    std::string gender;
 };
 
 // Resolves a real objectCrc to real SKELETAL mesh geometry (Phase 15) -
@@ -1182,6 +1191,11 @@ public:
             return std::nullopt;
         }
         SelfAnimationData result;
+        if (realIffPath.find("_female") != std::string::npos) {
+            result.gender = "female";
+        } else if (realIffPath.find("_male") != std::string::npos) {
+            result.gender = "male";
+        }
         try {
             result.skeleton = assets::Skeleton::parse(*sktBytes);
         } catch (const std::exception& e) {
@@ -1388,15 +1402,17 @@ const char* selfAnimationStateNameFor(uint8_t posture, bool isMoving) {
     }
 }
 
-// Looks up `stateName`'s real FIRST clip path in `table` - a real, valid
-// clip for that state in every case checked this session (see
-// AnimationState::clipPaths' own comment on why "first" is a fine, real
-// choice for v1 rather than modeling every SPAT/SSAT variant's selection
-// logic). Empty string if the state isn't found or has no clips.
-std::string selfClipPathForState(const assets::AnimationStateTableData& table, const char* stateName) {
+// Looks up `stateName`'s real selected clip path in `table`, walking the
+// state's own real selection tree (gender-branched, mood-varianted -
+// see AnimationStateTable.h's own comment) rather than blindly taking
+// whichever real clip a naive flatten happened to find first. Empty
+// string if the state isn't found.
+std::string selfClipPathForState(const assets::AnimationStateTableData& table, const char* stateName,
+                                  const std::string& gender, bool preferLocomotion) {
     for (const auto& state : table.states) {
-        if (state.name == stateName && !state.clipPaths.empty()) {
-            return state.clipPaths[0];
+        if (state.name == stateName) {
+            return assets::selectAnimationClip(state.root, assets::AnimationSelectionContext{gender},
+                                                preferLocomotion);
         }
     }
     return {};
@@ -2474,6 +2490,24 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     std::unordered_map<std::string, std::optional<assets::AnimationClipData>> selfClipCache;
     float selfAnimTimeSeconds = 0.0f;
     bool selfAnimResolveAttempted = false;
+    // Phase 21 real fix (2026-07-25) - the currently-active clip's own real
+    // CHNK LOCT average translation speed (see assets::AnimationClipData's
+    // own comment), 0.0f if the active clip has none (most non-locomotion
+    // clips). Used to scale animation playback speed to match self's real
+    // movement speed instead of always playing back at a fixed rate - a
+    // real, confirmed ~3x mismatch (this project's own walk speed constant
+    // is 4.5 units/sec; the real all_b_loc_walk_male.ans clip's own
+    // authored average speed is only ~1.55) was found to be the likely
+    // cause of a real, direct user report ("legs cross/exaggerated,
+    // MD-like" while walking) - the leg keyframe DATA itself was already
+    // confirmed individually well-formed and correctly synchronized, so a
+    // playback-RATE mismatch (not a decode/composition bug) is the
+    // remaining explanation. Updated one frame behind whichever clip is
+    // actually resolved for self each frame (see the per-object loop
+    // below) - a natural, negligible one-frame lag, not threaded through
+    // more tightly since the active clip only changes on real state
+    // transitions, not every frame.
+    float selfLastActiveClipAverageSpeed = 0.0f;
 
     // Phase 17 Step 4 - self's currently-tracked containing cell (0 =
     // outdoors/world-relative). Real capture evidence changed the original
@@ -2608,7 +2642,20 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         // been decoded from a clip's own header yet, so 1 unit == 1 real
         // keyframe "frame" field for now). Free-running/unbounded - each
         // channel wraps independently by its own real keyframe range.
-        selfAnimTimeSeconds += deltaSeconds * 30.0f; // assumed ~30fps source data, needs live tuning
+        // Real correction (2026-07-25): an earlier version of this line
+        // scaled the PLAYBACK RATE by (real speed / clip's own real LOCT
+        // average speed) - live-tested and confirmed WRONG, made the
+        // limbs swing much too fast. Re-reading the real leaked source
+        // (CompressedKeyframeAnimation::getScaledLocomotion) more
+        // carefully: the real client scales the LOCOMOTION TRANSLATION
+        // distance to match real movement speed, explicitly WITHOUT
+        // touching playback rate ("Scale translation appropriately.
+        // Rotation is ignored.") - joints always swing at the clip's own
+        // native authored cadence. Reverted to the original fixed rate;
+        // selfLastActiveClipAverageSpeed/the real LOCT data stays parsed
+        // and available for a future real translation-distance-scaling
+        // fix, just not used to scale time anymore.
+        selfAnimTimeSeconds += deltaSeconds * 30.0f;
 
         // Phase 18 - one-shot edge-detected toggle (same technique as
         // leftMouseWasDown below), not held-key, so tapping 'I' doesn't
@@ -2758,6 +2805,26 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                        << (selfSkipZNegationForRoot ? "ON" : "OFF") << " (clip cache cleared)\n";
         }
         rootRKeyWasDown = rootRKeyDown;
+
+        // Phase 21 (animation) diagnostic, added 2026-07-25 - same idea as
+        // the 'Z'/'R' keys above but for the leg chain, following a direct
+        // live user report: the legs visibly CROSS during walking (one leg
+        // swinging toward/through the other's side) rather than staying on
+        // their own side - the same class of lateral/handedness sign issue
+        // already confirmed and fixed for the wrist/finger chain this
+        // session. Clears the clip cache so already-resolved clips get
+        // re-parsed.
+        static bool selfSkipZNegationForLegs = false;
+        static bool legXKeyWasDown = false;
+        bool legXKeyDown = renderer::Window::isKeyDown('X');
+        if (legXKeyDown && !legXKeyWasDown) {
+            selfSkipZNegationForLegs = !selfSkipZNegationForLegs;
+            assets::AnimationClip::setSkipZNegationForLegsForTesting(selfSkipZNegationForLegs);
+            selfClipCache.clear();
+            std::cout << "[VISUALIZER] self skip-Z-negation-for-legs = "
+                       << (selfSkipZNegationForLegs ? "ON" : "OFF") << " (clip cache cleared)\n";
+        }
+        legXKeyWasDown = legXKeyDown;
 
         // Phase 21 (animation) diagnostic - bit-layout variant 2's
         // "always drop w" rule fixed the whole-body orientation and most
@@ -3659,8 +3726,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                         if (!selfAnimData->stateTable.states.empty()) {
                             auto cacheIt = selfClipCache.find(stateName);
                             if (cacheIt == selfClipCache.end()) {
-                                std::string clipPath =
-                                    selfClipPathForState(selfAnimData->stateTable, stateName);
+                                std::string clipPath = selfClipPathForState(
+                                    selfAnimData->stateTable, stateName, selfAnimData->gender, selfIsMoving);
                                 std::cout << "[ANIMDBG] resolved clip for state=" << stateName << ": "
                                            << clipPath << "\n";
                                 std::optional<assets::AnimationClipData> clip;
@@ -3673,6 +3740,13 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                 (cacheIt->second.has_value() && !forceBindPoseDebug)
                                     ? &cacheIt->second.value()
                                     : nullptr;
+                            // Real fix (2026-07-25) - see
+                            // selfLastActiveClipAverageSpeed's own comment.
+                            // Only real locomotion clips carry a non-zero
+                            // real LOCT average speed; leaving this at 0
+                            // for any other active clip means playback
+                            // falls back to the original fixed rate.
+                            selfLastActiveClipAverageSpeed = (clip != nullptr) ? clip->averageTranslationSpeed : 0.0f;
 
                             std::vector<int> clipBoneIndices;
                             if (clip != nullptr) {
@@ -3686,6 +3760,162 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                 selfUseRealBindPoseFormula);
                             auto worldTransforms =
                                 animation::computeWorldBoneTransforms(selfAnimData->skeleton, localTransforms);
+
+                            // Phase 21 diagnostic (2026-07-25) - real,
+                            // NUMBERS-ONLY leg-motion sanity check, added
+                            // specifically because describing what's wrong
+                            // in a moving walk cycle via screenshots proved
+                            // very hard for the user to convey precisely.
+                            // Checks two things directly from real world
+                            // bone positions, no visual interpretation
+                            // needed: (1) does the knee (lshin/rshin) bulge
+                            // FORWARD of the straight hip-to-ankle line (a
+                            // real human knee always does - bulging
+                            // backward would mean the leg is bending the
+                            // anatomically wrong direction), and (2) are
+                            // left and right thighs actually out of phase
+                            // with each other (a real gait alternates -
+                            // both legs forward/back at the same time would
+                            // mean something is wrong with per-side timing,
+                            // not per-joint direction). Throttled to ~3/sec
+                            // real time so the log stays readable.
+                            if (obj.isSelf && selfIsMoving) {
+                                static auto lastLegDiagTime = std::chrono::steady_clock::time_point{};
+                                auto nowDiag = std::chrono::steady_clock::now();
+                                if (nowDiag - lastLegDiagTime > std::chrono::milliseconds(333)) {
+                                    lastLegDiagTime = nowDiag;
+                                    auto findIdx = [&](const char* name) -> int {
+                                        for (size_t bi = 0; bi < selfAnimData->skeleton.bones.size(); ++bi) {
+                                            if (selfAnimData->skeleton.bones[bi].name.size() == std::strlen(name)) {
+                                                bool eq = true;
+                                                for (size_t ci = 0; ci < std::strlen(name); ++ci) {
+                                                    if (std::tolower(static_cast<unsigned char>(
+                                                            selfAnimData->skeleton.bones[bi].name[ci])) != name[ci]) {
+                                                        eq = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (eq) return static_cast<int>(bi);
+                                            }
+                                        }
+                                        return -1;
+                                    };
+                                    int rootIdx = findIdx("root");
+                                    int lThighIdx = findIdx("lthigh");
+                                    int lShinIdx = findIdx("lshin");
+                                    int lAnkleIdx = findIdx("lankle");
+                                    int rThighIdx = findIdx("rthigh");
+                                    int rShinIdx = findIdx("rshin");
+                                    int rAnkleIdx = findIdx("rankle");
+                                    if (rootIdx >= 0 && lThighIdx >= 0 && lShinIdx >= 0 && lAnkleIdx >= 0 &&
+                                        rThighIdx >= 0 && rShinIdx >= 0 && rAnkleIdx >= 0) {
+                                        using namespace DirectX;
+                                        auto worldPos = [&](int idx) {
+                                            XMFLOAT3 p;
+                                            XMStoreFloat3(&p, worldTransforms[static_cast<size_t>(idx)].r[3]);
+                                            return p;
+                                        };
+                                        XMFLOAT3 rootPos = worldPos(rootIdx);
+                                        // Forward direction from root's own world rotation (row 2 = local Z
+                                        // basis vector transformed to world) - same convention as this
+                                        // project's own yaw handling elsewhere (yaw=0 faces +Z).
+                                        XMVECTOR fwdVec = XMVector3Normalize(worldTransforms[static_cast<size_t>(rootIdx)].r[2]);
+                                        XMFLOAT3 fwd;
+                                        XMStoreFloat3(&fwd, fwdVec);
+
+                                        auto kneeBulge = [&](int hipIdx, int kneeIdx, int ankleIdx) {
+                                            XMFLOAT3 hip = worldPos(hipIdx);
+                                            XMFLOAT3 knee = worldPos(kneeIdx);
+                                            XMFLOAT3 ankle = worldPos(ankleIdx);
+                                            XMFLOAT3 mid{(hip.x + ankle.x) * 0.5f, (hip.y + ankle.y) * 0.5f,
+                                                         (hip.z + ankle.z) * 0.5f};
+                                            XMFLOAT3 offset{knee.x - mid.x, knee.y - mid.y, knee.z - mid.z};
+                                            return offset.x * fwd.x + offset.y * fwd.y + offset.z * fwd.z;
+                                        };
+                                        float lBulge = kneeBulge(lThighIdx, lShinIdx, lAnkleIdx);
+                                        float rBulge = kneeBulge(rThighIdx, rShinIdx, rAnkleIdx);
+
+                                        // Real forward/back extension of each ANKLE relative to root, along
+                                        // the same forward axis - reveals left/right phase directly. (Using
+                                        // the thigh bone's own origin here first was a real bug in this
+                                        // diagnostic, not a finding about the animation - the thigh's origin
+                                        // IS the hip socket, which barely translates; the actual swing shows
+                                        // up at the far end of the limb.)
+                                        XMFLOAT3 lAnklePos = worldPos(lAnkleIdx);
+                                        XMFLOAT3 rAnklePos = worldPos(rAnkleIdx);
+                                        float lExtent = (lAnklePos.x - rootPos.x) * fwd.x +
+                                                        (lAnklePos.y - rootPos.y) * fwd.y +
+                                                        (lAnklePos.z - rootPos.z) * fwd.z;
+                                        float rExtent = (rAnklePos.x - rootPos.x) * fwd.x +
+                                                        (rAnklePos.y - rootPos.y) * fwd.y +
+                                                        (rAnklePos.z - rootPos.z) * fwd.z;
+
+                                        // Lateral (sideways) check - does each ankle ever cross
+                                        // over to the WRONG side of the body's own centerline?
+                                        // Neither kneeBulge nor forward/back phase showed an
+                                        // anomaly, but the user's screenshots (walk7.png) clearly
+                                        // show the legs crossing near the feet - a sideways
+                                        // crossing wouldn't show up in either of those two checks,
+                                        // only in a left/right offset measured along the body's
+                                        // own right vector (row 0 of root's world basis, same
+                                        // convention as fwd using row 2).
+                                        XMVECTOR rightVec = XMVector3Normalize(worldTransforms[static_cast<size_t>(rootIdx)].r[0]);
+                                        XMFLOAT3 right;
+                                        XMStoreFloat3(&right, rightVec);
+                                        float lLateral = (lAnklePos.x - rootPos.x) * right.x +
+                                                          (lAnklePos.y - rootPos.y) * right.y +
+                                                          (lAnklePos.z - rootPos.z) * right.z;
+                                        float rLateral = (rAnklePos.x - rootPos.x) * right.x +
+                                                          (rAnklePos.y - rootPos.y) * right.y +
+                                                          (rAnklePos.z - rootPos.z) * right.z;
+                                        // With this project's skeleton convention, the LEFT ankle
+                                        // should stay on one consistent side (its own sign) and
+                                        // the RIGHT ankle on the other, for the ENTIRE cycle - if
+                                        // lLateral and rLateral ever have the SAME sign (or cross
+                                        // zero to the wrong side), that's a real crossing, distinct
+                                        // from the normal forward/back IN-PHASE moments.
+
+                                        // Root wobble check (tried, ruled out) - a baseline-compare
+                                        // of root's own local rotation showed swings up to 58deg,
+                                        // but toggling the root Z-negation-skip ('R' key) changed
+                                        // standing stance and did NOT fix the walk artifact - live
+                                        // user confirmation. That number was very likely just the
+                                        // player's own mouse-look turning while walking, which a
+                                        // single frozen baseline can't distinguish from a real
+                                        // per-frame animation bug. Removed in favor of a more
+                                        // direct measurement below.
+
+                                        // Direct leg-to-leg 3D distance check - the four checks
+                                        // above (knee bulge, phase, lateral sign, root wobble) all
+                                        // came back clean/ruled-out, but "clean" bone math doesn't
+                                        // rule out the two leg MESHES visually clipping through each
+                                        // other if the real separation between them is ever smaller
+                                        // than the model's own leg thickness - a real gait can look
+                                        // "crossed" on screen from mesh interpenetration alone, with
+                                        // no bug in the joint angles themselves. Measures actual
+                                        // Euclidean distance, not a signed projection, so it doesn't
+                                        // matter which side is "correct" - just how close the two
+                                        // legs physically get.
+                                        XMFLOAT3 lKneePos = worldPos(lShinIdx);
+                                        XMFLOAT3 rKneePos = worldPos(rShinIdx);
+                                        auto dist3 = [](const XMFLOAT3& a, const XMFLOAT3& b) {
+                                            float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+                                            return std::sqrt(dx * dx + dy * dy + dz * dz);
+                                        };
+                                        float ankleDist = dist3(lAnklePos, rAnklePos);
+                                        float kneeDist = dist3(lKneePos, rKneePos);
+
+                                        std::cout << "[ANIMDBG] LEG SANITY t=" << selfAnimTimeSeconds
+                                                   << " kneeBulge(+fwd/-back) L=" << lBulge << " R=" << rBulge
+                                                   << "  thighExtent L=" << lExtent << " R=" << rExtent
+                                                   << " (samesign=" << ((lExtent > 0) == (rExtent > 0) ? "IN-PHASE(bad?)" : "opposite(good)")
+                                                   << ")  LATERAL L=" << lLateral << " R=" << rLateral
+                                                   << "  ankleDist=" << ankleDist << " kneeDist=" << kneeDist
+                                                   << " (crossed=" << ((lLateral > 0) == (rLateral > 0) ? "SAME-SIDE(BAD)" : "opposite(good)")
+                                                   << ")\n";
+                                    }
+                                }
+                            }
 
                             // Phase 21 diagnostic - throttled dump of a
                             // couple of named bones' real animated state

@@ -63,6 +63,7 @@ add_executable(soe_tests
     test_assets_skeleton.cpp
     test_assets_skeletalmesh.cpp
     test_assets_skeletalappearance.cpp
+    test_assets_animationstatetable.cpp
     test_assets_buildinglayout.cpp
     test_assets_shadertemplate.cpp
     test_assets_ddsimage.cpp

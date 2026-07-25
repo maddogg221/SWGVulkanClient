@@ -17,8 +17,8 @@ constexpr uint32_t kRpstTag = 0x52505354; // 'RPST'
 constexpr uint32_t kBptrTag = 0x42505452; // 'BPTR'
 // 'BPRO' - per-bone "bind pose rotation" quaternion, same
 // insertChunkFloatQuaternion() encoding as RPRE/RPST (confirmed directly
-// against the leaked original SkeletonTemplateWriter.cpp source).
-// The real client composes a bone's bind-pose-relative local rotation as
+// against the leaked original SkeletonTemplateWriter.cpp source). The
+// real client composes a bone's bind-pose-relative local rotation as
 // `postRotation * (bindPoseRotation * preRotation)` (three terms), not the
 // `preRotation * postRotation` two-term approximation this project used
 // before discovering this chunk - every real `.skt` file has always

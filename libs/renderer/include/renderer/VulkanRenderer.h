@@ -47,6 +47,35 @@ struct MeshHandle {
     VkDescriptorSet textureDescriptorSet = VK_NULL_HANDLE;
 };
 
+// A dynamically-updatable mesh (added Phase 21, animation) - unlike
+// MeshHandle (device-local, uploaded once via loadStaticMesh(), immutable
+// afterward), this is host-visible and persistently mapped, meant to be
+// rewritten via updateDynamicMesh() every frame its contents change (e.g.
+// a skinned character's CPU-skinned pose). Reuses the exact same mesh
+// pipeline/shader/vertex layout as MeshHandle/drawMesh() - only the upload
+// strategy differs, so no new shader or pipeline object is needed. Sized
+// once at allocateDynamicMesh() time to a caller-chosen max vertex/index
+// count (a real submesh's own counts, known ahead of time from its
+// resolved assets::SkeletalMeshSubmesh); updateDynamicMesh() may write
+// fewer than the max (it does not resize the mesh's shape, only its
+// current vertex/index count changes are never expected in practice since
+// a submesh's own vertex/index count is fixed once resolved - callers are
+// still expected to pass the same counts every update).
+struct DynamicMeshHandle {
+    std::vector<VkBuffer> vertexBuffers;           // one per frame-in-flight
+    std::vector<VmaAllocation> vertexAllocations;
+    std::vector<void*> vertexMapped;
+    size_t maxVertices = 0;
+
+    std::vector<VkBuffer> indexBuffers;             // one per frame-in-flight
+    std::vector<VmaAllocation> indexAllocations;
+    std::vector<void*> indexMapped;
+    size_t maxIndices = 0;
+
+    uint32_t currentIndexCount = 0;
+    VkDescriptorSet textureDescriptorSet = VK_NULL_HANDLE; // same meaning as MeshHandle's own
+};
+
 // An uploaded label text texture (see createTextTexture()) plus its
 // pre-bound combined-image-sampler descriptor set, ready to pass straight
 // into drawLabel(). Replaces the D3D11 version's
@@ -108,6 +137,31 @@ public:
     MeshHandle loadStaticMesh(const assets::MeshData& mesh);
     void drawMesh(const MeshHandle& handle, const DirectX::XMFLOAT3& center, float yawRadians,
                   const DirectX::XMFLOAT4& color);
+
+    // Allocates a DynamicMeshHandle's GPU buffers, sized for up to
+    // `maxVertices`/`maxIndices` - see DynamicMeshHandle's own comment.
+    // Contents are undefined until the first updateDynamicMesh() call.
+    DynamicMeshHandle allocateDynamicMesh(size_t maxVertices, size_t maxIndices);
+
+    // Rewrites this frame-in-flight's copy of `handle`'s vertex/index data
+    // (see DynamicMeshHandle's own comment on why there's one copy per
+    // frame-in-flight rather than a single shared buffer) - call once per
+    // frame, right before drawDynamicMesh(), whenever the mesh's pose has
+    // changed. `mesh.positions.size()`/`mesh.indices.size()` must not
+    // exceed the handle's own maxVertices/maxIndices.
+    void updateDynamicMesh(DynamicMeshHandle& handle, const assets::MeshData& mesh);
+
+    // Same draw semantics as drawMesh(), against whichever frame-in-flight
+    // copy updateDynamicMesh() last wrote this frame.
+    void drawDynamicMesh(const DynamicMeshHandle& handle, const DirectX::XMFLOAT3& center,
+                          float yawRadians, const DirectX::XMFLOAT4& color);
+
+    // Frees a DynamicMeshHandle's GPU buffers - unlike MeshHandle (a bounded
+    // set of template meshes, kept for the renderer's whole lifetime, see
+    // ownedMeshes_), dynamic meshes are per-VISIBLE-OBJECT and callers are
+    // expected to free one as soon as its owning object leaves view. Safe to
+    // call at most once per handle.
+    void destroyDynamicMesh(DynamicMeshHandle& handle);
 
     // Uploads a real, already-decoded compressed texture (see
     // assets::DdsImage) - REPEAT-addressed (tiled), unlike label textures'

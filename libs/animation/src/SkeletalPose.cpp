@@ -365,8 +365,9 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
         // snap/tear between adjacent frames, and would compound down a
         // parent-child chain exactly as observed live.
         {
-            static const char* kWatchChain[] = {"lwrist", "lring01", "lring02",
-                                                 "rwrist", "rring01", "rring02"};
+            static const char* kWatchChain[] = {"lwrist", "lring01", "lring02", "rwrist", "rring01", "rring02",
+                                                 "lthigh", "lshin",  "lankle",  "ltoe",   "rthigh",  "rshin",
+                                                 "rankle", "rtoe",   "root"};
             bool isWatchedChainBone = false;
             for (const char* n : kWatchChain) {
                 if (equalsIgnoreCase(bone.name, n)) { isWatchedChainBone = true; break; }

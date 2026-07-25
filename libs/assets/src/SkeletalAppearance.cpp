@@ -11,6 +11,7 @@ constexpr uint32_t kSmatTag = 0x534D4154; // 'SMAT'
 constexpr uint32_t kInfoTag = 0x494E464F; // 'INFO'
 constexpr uint32_t kMsgnTag = 0x4D53474E; // 'MSGN'
 constexpr uint32_t kSktiTag = 0x534B5449; // 'SKTI'
+constexpr uint32_t kLatxTag = 0x4C415458; // 'LATX'
 } // namespace
 
 SkeletalAppearanceData SkeletalAppearance::parse(const std::vector<uint8_t>& bytes) {
@@ -51,9 +52,23 @@ SkeletalAppearanceData SkeletalAppearance::parse(const std::vector<uint8_t>& byt
     // data checked this session always has numSKTI == 1.
     std::string skeletonFilename = readNulTerminatedString(sktiBuf);
 
+    std::string latFilename;
+    if (const IffChunk* latxChunk = findFirstChunk(root, kLatxTag)) {
+        soe::PacketBuffer latxBuf = latxChunk->data;
+        latxBuf.resetReadCursor();
+        uint16_t numLatxPairs = latxBuf.readUint16();
+        if (numLatxPairs > 0) {
+            // Only the first [skeletonFile, latFile] pair is needed, same
+            // reasoning as SKTI above.
+            readNulTerminatedString(latxBuf); // skeletonFile, unused (already have it from SKTI)
+            latFilename = readNulTerminatedString(latxBuf);
+        }
+    }
+
     SkeletalAppearanceData result;
     result.meshFilenames = std::move(meshFilenames);
     result.skeletonFilename = std::move(skeletonFilename);
+    result.latFilename = std::move(latFilename);
     return result;
 }
 

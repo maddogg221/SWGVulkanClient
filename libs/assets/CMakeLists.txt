@@ -10,6 +10,8 @@ add_library(assets STATIC
     src/SkeletalMeshLod.cpp
     src/SkeletalMesh.cpp
     src/SkeletalAppearance.cpp
+    src/AnimationStateTable.cpp
+    src/AnimationClip.cpp
     src/BuildingLayout.cpp
     src/ShaderTemplate.cpp
     src/DdsImage.cpp

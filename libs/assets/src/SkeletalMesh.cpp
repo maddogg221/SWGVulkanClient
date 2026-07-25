@@ -215,12 +215,14 @@ SkeletalMeshData SkeletalMesh::parse(const std::vector<uint8_t>& bytes) {
         submesh.positions.reserve(numIndex);
         submesh.normals.reserve(numIndex);
         submesh.uv0.reserve(numIndex);
+        submesh.sourceVertexIndices.reserve(numIndex);
         for (uint32_t i = 0; i < numIndex; ++i) {
             if (pidx[i] >= meshPositions.size() || nidx[i] >= meshNormals.size()) {
                 throw std::runtime_error("SkeletalMesh::parse: PIDX/NIDX index out of range");
             }
             submesh.positions.push_back(meshPositions[pidx[i]]);
             submesh.normals.push_back(meshNormals[nidx[i]]);
+            submesh.sourceVertexIndices.push_back(pidx[i]);
             Float2 uv;
             uv.x = tcsdBuf.readFloat();
             uv.y = tcsdBuf.readFloat();

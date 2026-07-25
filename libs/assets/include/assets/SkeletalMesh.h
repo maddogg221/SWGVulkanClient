@@ -29,6 +29,12 @@ struct SkeletalMeshSubmesh {
     std::vector<Float3> normals;
     std::vector<Float2> uv0;
     std::vector<uint32_t> indices;
+    // Real PIDX value each flattened `positions[i]`/`normals[i]` came from -
+    // i.e. its index into the mesh-level `SkeletalMeshData::vertexWeights`
+    // (added Phase 21, animation) - lets a runtime skinning pass look up
+    // each flattened vertex's real bone weights without re-deriving the
+    // PIDX/NIDX indirection this constructor already resolved once.
+    std::vector<uint32_t> sourceVertexIndices;
 };
 
 // Plain, renderer-agnostic skinned-mesh data. Real files can legitimately

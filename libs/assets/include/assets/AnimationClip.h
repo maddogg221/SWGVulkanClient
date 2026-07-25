@@ -39,6 +39,15 @@ struct AnimationBoneChannel {
     std::vector<ScalarKeyframe> translationAxis[3];
 };
 
+// One real locomotion-curve keyframe from a real CHNK LOCT (see
+// AnimationClipData's own comment) - a real, UNCOMPRESSED translation
+// (unlike per-bone ATRN channels, which store x/y/z as three separate
+// scalar curves, LOCT stores one real Vector per keyframe directly).
+struct LocomotionKeyframe {
+    uint16_t frame = 0;
+    Float3 translation;
+};
+
 // Plain data from a real ".ans" file (FORM CKAT) - a per-bone keyframe
 // animation clip. Real structure confirmed by dumping several actual
 // extracted .ans files (see AnimationClip.cpp for the exact byte layout of
@@ -51,11 +60,22 @@ struct AnimationBoneChannel {
 // translation-keyframe channels, only ever 3 total in samples checked -
 // one clip only ever animates one bone's translation, `root`) +
 // CHNK STRN (real per-bone scale-channel floats, confirmed all-zero/unused
-// in every sample checked - not decoded) + CHNK LOCT (real, purpose not
-// confirmed - likely root-motion/locomotion extraction data, separate from
-// ATRN - not decoded).
+// in every sample checked - not decoded) + CHNK LOCT (real locomotion
+// data, confirmed 2026-07-25 directly against the leaked original
+// CompressedKeyframeAnimationTemplate.cpp source - a real average
+// translation speed float, plus a real, separate, UNCOMPRESSED translation
+// keyframe curve, distinct from any per-bone channel above and distinct
+// from `root`'s own ATRN channel - the real client uses this specifically
+// to SCALE animation playback speed to match a character's actual real
+// movement speed (`getScaledLocomotion`), which this project's own
+// playback previously never did, always advancing at a fixed rate
+// regardless of real movement speed).
 struct AnimationClipData {
     std::vector<AnimationBoneChannel> bones;
+    // 0.0f if this clip has no real LOCT chunk at all (a real, valid case
+    // - non-locomotion clips, e.g. idle/combat-move clips, don't have one).
+    float averageTranslationSpeed = 0.0f;
+    std::vector<LocomotionKeyframe> locomotionTranslationKeys;
 };
 
 class AnimationClip {
@@ -109,6 +129,17 @@ public:
     // parse() call. Not thread-safe; fine for this project's
     // single-threaded self-only v1 animation path.
     static void setSkipZNegationForRootForTesting(bool skip);
+
+    // Phase 21 live-debug aid, added 2026-07-25 - same idea as
+    // setSkipZNegationForArmsForTesting but for the leg chain
+    // (lthigh/lshin/lankle/ltoe + r* counterparts). Direct user report from
+    // a real live walk cycle: the legs visibly CROSS during walking - a
+    // real, distinctive signature of a lateral/handedness sign error, the
+    // same class of bug already confirmed and fixed for the wrist/finger
+    // chain this session. Affects every subsequent parse() call. Not
+    // thread-safe; fine for this project's single-threaded self-only v1
+    // animation path.
+    static void setSkipZNegationForLegsForTesting(bool skip);
 
     // Phase 21 live-debug aid - bit-layout variant 2's "always drop w" rule
     // (see setBitLayoutVariantForTesting's own comment) fixed the

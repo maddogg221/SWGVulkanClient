@@ -70,6 +70,18 @@ source code.
   geometry — a real switchback staircase (where a lower flight can share the same
   horizontal footprint as its own upper entrance) is only solvable using that file's
   real per-triangle adjacency data, not a simple raycast or point-in-polygon test.
+- **Real skeletal animation**: real keyframe playback replacing the earlier static
+  bind-pose rendering, driven by the client's own recursive animation-state
+  selection format (a real gender/mood-aware switch/container tree, not a flat clip
+  list — an earlier naive "pick the first clip" model could silently select the
+  wrong gender or wrong category of animation). A long-standing wrist/finger
+  mesh-tearing artifact was resolved: the real quaternion chunks store their
+  components in a different order than this project's parser originally assumed,
+  a byte-order bug that had survived many prior calibrated-fix attempts because
+  bones with symmetric rotation values happened to self-cancel it. The walk cycle
+  specifically still has a known, unresolved visual defect — see the process note
+  below on numeric-diagnostic debugging for how this is currently being tracked
+  down.
 
 ## Process notes
 
@@ -88,3 +100,15 @@ worth stating plainly for anyone evaluating the codebase:
   assumed to inherit correctness from related work.
 - **Detect and stop, don't guess.** Unknown or ambiguous wire data and asset bytes
   produce a clear, logged failure in this codebase — never a silent misdecode.
+- **When a visual defect resists description, measure it instead.** A live walk-
+  cycle animation defect proved very hard to pin down from screenshots and verbal
+  description alone. The fix was to stop guessing from pictures and add live,
+  numeric diagnostics computed directly from real skeleton bone positions while
+  walking against a real server — signed geometric checks (does a knee bend the
+  anatomically correct direction, do the left and right limbs alternate phase, does
+  either foot cross the body's own centerline) plus a direct 3D distance
+  measurement between corresponding joints. Several of these came back clean,
+  which was itself useful information: it ruled out a skeleton-math bug of the
+  same class as the earlier quaternion byte-order fix, and pointed instead toward
+  the mesh geometry or its vertex-weight blending as the more likely remaining
+  cause — still open as of this writing.

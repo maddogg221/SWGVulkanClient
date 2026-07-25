@@ -18,6 +18,7 @@ constexpr uint32_t kArotTag = 0x41524F54; // 'AROT'
 constexpr uint32_t kQchnTag = 0x5143484E; // 'QCHN'
 constexpr uint32_t kAtrnTag = 0x4154524E; // 'ATRN'
 constexpr uint32_t kChnlTag = 0x43484E4C; // 'CHNL'
+constexpr uint32_t kLoctTag = 0x4C4F4354; // 'LOCT'
 
 // Real, live-extracted per-context-byte lookup table (x32dbg static-memory
 // dump of swgemu.exe:01945BB8, 2026-07-22 morning session). Each real
@@ -158,6 +159,16 @@ bool g_experimentSkipZNegationForArms = false;
 // real for arms, now being tested for root specifically. true = skip the
 // Z-negation for the `root` bone only.
 bool g_experimentSkipZNegationForRoot = false;
+
+// Phase 21 live experiment (2026-07-25) - direct user report from a real
+// walk cycle: the legs visibly CROSS during walking (one leg swinging
+// toward/through the other's side) rather than staying on their own side -
+// a real, distinctive signature of a lateral/handedness sign error, the
+// same class of bug already found and fixed for the wrist/finger chain
+// this session (Z-negation needed SKIPPED there, unlike every other
+// bone). Testing the identical fix for the leg chain. true = skip the
+// Z-negation for leg-chain bones only.
+bool g_experimentSkipZNegationForLegs = false;
 
 bool isArmChainBone(const std::string& boneName) {
     // Phase 21 live experiment: tried extending this to include finger
@@ -436,17 +447,18 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
     }
 
     // Real fix, live-verified 2026-07-25 (post quaternion-byte-order-fix
-    // retest of the Phase 21 finger 'H' axis-fix debug key, previously
-    // tested with a negative result under the OLD, byte-order-broken
-    // skeleton parser - that old result no longer applies): the
-    // wrist/finger chain (this project's own isFingerChainBone list,
-    // already widened to include forearm/ulna/wrist) needs Z-negation
-    // SKIPPED, unlike every other bone - direct live A/B against a live
-    // private test server confirmed fingers curl the correct direction
-    // (into the palm, not away from it) only once this is applied. Now
-    // the permanent default rather than a manual debug-key toggle.
+    // retest of the finger 'H' axis-fix debug key, previously tested with a
+    // negative result under the OLD, byte-order-broken skeleton parser -
+    // that old result no longer applies): the wrist/finger chain (this
+    // project's own isFingerChainBone list, already widened to include
+    // forearm/ulna/wrist) needs Z-negation SKIPPED, unlike every other bone
+    // - direct live A/B against a live private test server confirmed
+    // fingers curl the correct direction (into the palm, not away from it)
+    // only once this is applied. Now the permanent default rather than a
+    // manual debug-key toggle.
     bool skipZNegation = (g_experimentSkipZNegationForArms && isArmChainBone(boneNameForDebug)) ||
                           (g_experimentSkipZNegationForRoot && isRootBone(boneNameForDebug)) ||
+                          (g_experimentSkipZNegationForLegs && isLegChainBone(boneNameForDebug)) ||
                           isFingerChainBone(boneNameForDebug);
     int forcedIdxOverride = -1;
     if (g_legForcedDropIndex >= 0 && isLegChainBone(boneNameForDebug)) {
@@ -492,6 +504,27 @@ std::vector<ScalarKeyframe> parseChnl(const IffChunk& chunk) {
     return result;
 }
 
+// A real CHNK LOCT: float32 averageTranslationSpeed, then uint16 keyCount,
+// then `keyCount` real [uint16 frame][float32 x][float32 y][float32 z]
+// records (a real, UNCOMPRESSED Vector per keyframe - confirmed directly
+// against the leaked original CompressedKeyframeAnimationTemplate.cpp
+// source, 2026-07-25, not guessed from byte patterns).
+void parseLoct(const IffChunk& chunk, AnimationClipData& result) {
+    soe::PacketBuffer buf = chunk.data;
+    buf.resetReadCursor();
+    result.averageTranslationSpeed = buf.readFloat();
+    uint16_t keyCount = buf.readUint16();
+    result.locomotionTranslationKeys.reserve(keyCount);
+    for (uint16_t i = 0; i < keyCount; ++i) {
+        LocomotionKeyframe kf;
+        kf.frame = buf.readUint16();
+        kf.translation.x = buf.readFloat();
+        kf.translation.y = buf.readFloat();
+        kf.translation.z = buf.readFloat();
+        result.locomotionTranslationKeys.push_back(kf);
+    }
+}
+
 } // namespace
 
 AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
@@ -511,6 +544,7 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
         throw std::runtime_error("AnimationClip::parse: missing XFRM or AROT form");
     }
     const IffChunk* atrnForm = findFirstForm(clipForm, kAtrnTag); // optional - not every real clip animates a translated bone
+    const IffChunk* loctChunk = findFirstChunk(clipForm, kLoctTag); // optional - only real locomotion clips (walk/run) have one
 
     std::vector<const IffChunk*> qchnChunks;
     for (const IffChunk& child : arotForm->children) {
@@ -589,6 +623,9 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
         }
         result.bones.push_back(std::move(bone));
     }
+    if (loctChunk != nullptr) {
+        parseLoct(*loctChunk, result);
+    }
     return result;
 }
 
@@ -602,6 +639,10 @@ void AnimationClip::setSkipZNegationForArmsForTesting(bool skip) {
 
 void AnimationClip::setSkipZNegationForRootForTesting(bool skip) {
     g_experimentSkipZNegationForRoot = skip;
+}
+
+void AnimationClip::setSkipZNegationForLegsForTesting(bool skip) {
+    g_experimentSkipZNegationForLegs = skip;
 }
 
 void AnimationClip::setLegForcedDropIndexForTesting(int forcedIdx) {

@@ -2261,6 +2261,175 @@ void VulkanRenderer::drawMesh(const MeshHandle& handle, const XMFLOAT3& center, 
     }
 }
 
+DynamicMeshHandle VulkanRenderer::allocateDynamicMesh(size_t maxVertices, size_t maxIndices) {
+    DynamicMeshHandle handle;
+    handle.maxVertices = maxVertices;
+    handle.maxIndices = maxIndices;
+    handle.vertexBuffers.resize(kMaxFramesInFlight);
+    handle.vertexAllocations.resize(kMaxFramesInFlight);
+    handle.vertexMapped.resize(kMaxFramesInFlight);
+    handle.indexBuffers.resize(kMaxFramesInFlight);
+    handle.indexAllocations.resize(kMaxFramesInFlight);
+    handle.indexMapped.resize(kMaxFramesInFlight);
+
+    VkDeviceSize vertexBytes = sizeof(MeshVertex) * std::max<size_t>(maxVertices, 1);
+    VkDeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(maxIndices, 1);
+
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        VkBufferCreateInfo vbInfo{};
+        vbInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        vbInfo.size = vertexBytes;
+        vbInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        vbInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo vbAllocInfo{};
+        vbAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+        vbAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VmaAllocationInfo vbAllocResult{};
+        vkCheck(static_cast<VkResult>(vmaCreateBuffer(allocator_, &vbInfo, &vbAllocInfo,
+                                                        &handle.vertexBuffers[i],
+                                                        &handle.vertexAllocations[i], &vbAllocResult)),
+                "vmaCreateBuffer (dynamic mesh vertex)");
+        handle.vertexMapped[i] = vbAllocResult.pMappedData;
+        // Phase 21 live investigation: this buffer's own header comment
+        // already says its real contents are undefined until the first
+        // updateDynamicMesh() call - VMA_MEMORY_USAGE_CPU_TO_GPU host-
+        // visible memory is NOT guaranteed zeroed by the driver, so a real
+        // read of this slot before it's ever been written (whatever the
+        // exact real trigger turns out to be) would interpret raw garbage
+        // floats as vertex positions - a real, visually catastrophic
+        // "sail" of huge/random triangles, exactly matching a real live
+        // symptom (self's mesh briefly showing a huge triangular-sail
+        // shape right at the very first rendered frame after a fresh
+        // connect, before any per-frame animation issue could explain it -
+        // confirmed live via a real per-vertex bounding-box diagnostic
+        // that showed NORMAL, plausible CPU-computed positions at the same
+        // moment, isolating the mismatch to the GPU-visible buffer
+        // specifically). Zeroing here guarantees a real worst-case read
+        // before the first real update sees an all-zero (degenerate,
+        // invisible) mesh instead of undefined garbage.
+        std::memset(handle.vertexMapped[i], 0, static_cast<size_t>(vertexBytes));
+
+        VkBufferCreateInfo ibInfo{};
+        ibInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        ibInfo.size = indexBytes;
+        ibInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        ibInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo ibAllocInfo{};
+        ibAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+        ibAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+        VmaAllocationInfo ibAllocResult{};
+        vkCheck(static_cast<VkResult>(vmaCreateBuffer(allocator_, &ibInfo, &ibAllocInfo,
+                                                        &handle.indexBuffers[i],
+                                                        &handle.indexAllocations[i], &ibAllocResult)),
+                "vmaCreateBuffer (dynamic mesh index)");
+        handle.indexMapped[i] = ibAllocResult.pMappedData;
+        std::memset(handle.indexMapped[i], 0, static_cast<size_t>(indexBytes));
+    }
+    return handle;
+}
+
+void VulkanRenderer::updateDynamicMesh(DynamicMeshHandle& handle, const assets::MeshData& mesh) {
+    if (currentFrame_ >= handle.vertexMapped.size()) return;
+
+    std::vector<MeshVertex> vertices(mesh.positions.size());
+    for (size_t i = 0; i < mesh.positions.size(); ++i) {
+        vertices[i].position = XMFLOAT3(mesh.positions[i].x, mesh.positions[i].y, mesh.positions[i].z);
+        vertices[i].normal = XMFLOAT3(mesh.normals[i].x, mesh.normals[i].y, mesh.normals[i].z);
+        if (i < mesh.uv0.size()) {
+            vertices[i].uv = XMFLOAT2(mesh.uv0[i].x, mesh.uv0[i].y);
+        } else {
+            vertices[i].uv = XMFLOAT2(0.0f, 0.0f);
+        }
+    }
+
+    size_t vertexCount = std::min(vertices.size(), handle.maxVertices);
+    std::memcpy(handle.vertexMapped[currentFrame_], vertices.data(), sizeof(MeshVertex) * vertexCount);
+
+    size_t indexCount = std::min(mesh.indices.size(), handle.maxIndices);
+    std::memcpy(handle.indexMapped[currentFrame_], mesh.indices.data(), sizeof(uint32_t) * indexCount);
+
+    handle.currentIndexCount = static_cast<uint32_t>(indexCount);
+}
+
+void VulkanRenderer::drawDynamicMesh(const DynamicMeshHandle& handle, const XMFLOAT3& center,
+                                      float yawRadians, const XMFLOAT4& color) {
+    if (meshPipeline_ == VK_NULL_HANDLE) return;
+    if (handle.currentIndexCount == 0) return;
+    if (currentFrame_ >= handle.vertexBuffers.size()) return;
+
+    VkDeviceSize maxBytes = meshUniformAlignment_ * kMaxMeshDrawsPerFrame;
+    if (meshUniformOffset_ + meshUniformAlignment_ > maxBytes) {
+        return;
+    }
+
+    XMMATRIX world = XMMatrixRotationY(yawRadians) * XMMatrixTranslation(center.x, center.y, center.z);
+    MeshDrawConstants constants{};
+    XMStoreFloat4x4(&constants.worldViewProj, XMMatrixTranspose(world * viewProjection_));
+    XMStoreFloat4x4(&constants.world, XMMatrixTranspose(world));
+    constants.color = color;
+
+    auto* dst = reinterpret_cast<uint8_t*>(meshUniformMapped_[currentFrame_]) + meshUniformOffset_;
+    std::memcpy(dst, &constants, sizeof(constants));
+
+    vkCmdBindPipeline(currentCmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
+
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(currentCmd_, 0, 1, &handle.vertexBuffers[currentFrame_], &offset);
+    vkCmdBindIndexBuffer(currentCmd_, handle.indexBuffers[currentFrame_], 0, VK_INDEX_TYPE_UINT32);
+
+    uint32_t dynamicOffset = static_cast<uint32_t>(meshUniformOffset_);
+    vkCmdBindDescriptorSets(currentCmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                             &meshUniformDescriptorSets_[currentFrame_], 1, &dynamicOffset);
+
+    VkDescriptorSet textureSet = handle.textureDescriptorSet != VK_NULL_HANDLE
+                                      ? handle.textureDescriptorSet
+                                      : whiteFallbackTexture_.descriptorSet;
+    vkCmdBindDescriptorSets(currentCmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 1, 1,
+                             &textureSet, 0, nullptr);
+
+    vkCmdDrawIndexed(currentCmd_, handle.currentIndexCount, 1, 0, 0, 0);
+
+    meshUniformOffset_ += meshUniformAlignment_;
+
+    // Restore the wireframe pipeline/buffers - same reasoning as drawMesh()'s
+    // own identical restore at its end.
+    if (wireframePipeline_ != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(currentCmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframePipeline_);
+        VkDeviceSize boxOffset = 0;
+        vkCmdBindVertexBuffers(currentCmd_, 0, 1, &boxVertexBuffer_, &boxOffset);
+        vkCmdBindIndexBuffer(currentCmd_, boxIndexBuffer_, 0, VK_INDEX_TYPE_UINT16);
+    }
+}
+
+void VulkanRenderer::destroyDynamicMesh(DynamicMeshHandle& handle) {
+    // Same real race + fix as unloadTerrainChunk() (see its own comment,
+    // VUID-vkDestroyBuffer-buffer-00922 confirmed live): a not-yet-finished
+    // command buffer from a prior frame may still reference this handle's
+    // buffers, so wait on every in-flight fence except the current slot
+    // (already proven safe by this frame's own beginFrame()) before
+    // freeing.
+    for (size_t i = 0; i < inFlightFences_.size(); ++i) {
+        if (i == currentFrame_) continue;
+        vkWaitForFences(device_, 1, &inFlightFences_[i], VK_TRUE, UINT64_MAX);
+    }
+
+    for (size_t i = 0; i < handle.vertexBuffers.size(); ++i) {
+        if (handle.vertexBuffers[i] != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocator_, handle.vertexBuffers[i], handle.vertexAllocations[i]);
+        }
+    }
+    for (size_t i = 0; i < handle.indexBuffers.size(); ++i) {
+        if (handle.indexBuffers[i] != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocator_, handle.indexBuffers[i], handle.indexAllocations[i]);
+        }
+    }
+    handle = DynamicMeshHandle{};
+}
+
 TerrainChunkHandle VulkanRenderer::loadTerrainChunk(const terrain::TerrainMeshData& mesh) {
     std::vector<TerrainVertexGpu> vertices(mesh.vertices.size());
     for (size_t i = 0; i < mesh.vertices.size(); ++i) {
