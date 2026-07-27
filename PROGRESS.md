@@ -121,3 +121,23 @@ worth stating plainly for anyone evaluating the codebase:
   cause is most likely in how those rotations compose rather than the recorded
   values themselves — still open, but now a specific, narrow target instead of
   an open-ended visual impression.
+- **Follow-up: the walk-stride composition target has now been exhausted.** Every
+  concrete hypothesis for how the leg rotations combine into a final pose was
+  checked directly and came back clean: an alternate, independently-confirmed
+  composition formula produces a mathematically identical result for the leg
+  chain specifically (the per-bone correction values involved are exactly zero
+  there), real bone length stays perfectly constant across a full walk cycle
+  with zero stretching, and the clip being played back was confirmed to be the
+  correct, standard one rather than an unusually exaggerated variant. Most
+  conclusively, an independent, unrelated 3D application was fed the same
+  already-decoded keyframe data from a completely fresh starting state — no
+  awareness of this project's own code, no shared assumptions — and it
+  reproduced the identical stride, matching this project's own computed values
+  essentially exactly, bone for bone, frame for frame. That's about as strong a
+  signal as this kind of investigation can produce: the recorded animation data
+  itself, played back faithfully, genuinely contains this range of motion. The
+  stride-length difference is very likely not a bug in this project's own
+  reimplementation. Attention has shifted to the resting/idle pose instead,
+  which — unlike the legs — does involve real, non-trivial per-bone correction
+  values that haven't been tested against an alternate composition approach
+  yet.

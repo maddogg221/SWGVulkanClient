@@ -30,19 +30,32 @@ def apply_animation(arm_obj, data, action_name="SWG_Clip"):
         arm_obj.animation_data_create()
     arm_obj.animation_data.action = action
 
-    bones_by_name = {b["name"]: b for b in data["bones"]}
+    # Real bug found live (2026-07-25/26): the JSON dump's skeleton section
+    # uses mixed-case real bone names (e.g. "lThigh") while its clip section
+    # uses lowercase real names (e.g. "lthigh") - a real, confirmed casing
+    # difference between the two real sources this dump pulls from, NOT a
+    # bug in either C++ parser (this project's own bindClipBoneIndices()
+    # already matches case-insensitively - see SkeletalPose.cpp - so the
+    # live rendering path was never affected). This toolkit's own lookup
+    # was case-SENSITIVE, silently skipping every real bone whose clip name
+    # and skeleton name happened to differ in case - which turned out to be
+    # most of the leg chain, so only 5 of ~30+ real animated bones were
+    # ever actually keyframed. Matched case-insensitively now, same
+    # convention as the C++ side.
+    bones_by_name_lower = {b["name"].lower(): b for b in data["bones"]}
+    pose_bones_by_name_lower = {pb.name.lower(): pb for pb in arm_obj.pose.bones}
     animated_count = 0
 
     for clip_bone in data["clipBones"]:
         bone_name = clip_bone["boneName"]
-        skel_bone = bones_by_name.get(bone_name)
+        skel_bone = bones_by_name_lower.get(bone_name.lower())
         if skel_bone is None:
             continue  # real clip bone with no matching skeleton bone - skip, same as this
             # project's own bindClipBoneIndices() falling back to -1
         keyframes = clip_bone["rotationKeyframes"]
         if not keyframes:
             continue
-        pb = arm_obj.pose.bones.get(bone_name)
+        pb = pose_bones_by_name_lower.get(bone_name.lower())
         if pb is None:
             continue
         pre_rot = tuple(skel_bone["preRotation"])
