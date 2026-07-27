@@ -141,3 +141,22 @@ worth stating plainly for anyone evaluating the codebase:
   which — unlike the legs — does involve real, non-trivial per-bone correction
   values that haven't been tested against an alternate composition approach
   yet.
+- **Follow-up: two more resting-pose hypotheses tested and ruled out,
+  each with a numeric explanation, not just a screenshot.** Building a
+  small automated capture harness (drives the same internal state a human
+  tester would, on a timer, rather than needing a live person at the
+  keyboard for every comparison) made it possible to A/B two more
+  candidate fixes cleanly. First, the per-bone correction value that
+  looked promising for the arms turned out to be negligible there too,
+  once measured directly — the earlier suspicion that it might matter
+  specifically for arms (unlike the legs, where it's exactly zero) didn't
+  hold up against the real numbers. Second, every way of ordering how a
+  bone's rotation components combine was swept and compared side by side;
+  all of them land on essentially the same pose, because one of the real
+  correction values involved is large enough to dominate the result
+  regardless of ordering. Both are genuine negative results with a
+  mechanical reason behind them, not just "still doesn't look right" —
+  and, in the process, it became clear that "resting" isn't actually a
+  bare, unanimated pose at all: the character is always playing a real,
+  low-amplitude idle animation, even standing still, which reframes what
+  the remaining open question even is.

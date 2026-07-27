@@ -3,6 +3,7 @@ out/
 .cache/
 CMakeUserPresets.json
 __pycache__/
+diagnostic_screenshots/
 
 # If you keep any local notes with real server credentials while working on
 # this project, name them *.local.md - this pattern keeps them out of git.

@@ -960,6 +960,14 @@ struct CliOptions {
                              // wireframe debug visualizer (Windows/D3D11 only, see
                              // libs/renderer). Not built at all on non-Windows configurations.
 
+    // Phase 21 rest-pose investigation - see runVisualizer's own comment on
+    // autoRestPoseTestSecondsPerPhase. 0 = disabled (normal interactive
+    // visualizer). Only meaningful together with --visualize.
+    int autoRestPoseTestSecondsPerPhase = 0;
+    // Same idea, sweeping rotationCompositionVariant (0-5) instead - see
+    // runVisualizer's own comment on autoRestPoseVariantSweepSecondsPerPhase.
+    int autoRestPoseVariantSweepSecondsPerPhase = 0;
+
     // Real SWG client install directory - used by the visualizer's
     // RealMeshResolver to open real .tre archives and render actual
     // geometry instead of placeholder boxes where resolution succeeds.
@@ -1028,6 +1036,10 @@ CliOptions parseCommandLine(int argc, char** argv) {
         else if (arg == "--watch-resync") opts.watchResyncSeconds = std::stoi(next("--watch-resync"));
         else if (arg == "--capture-objcontroller") opts.captureObjController = true;
         else if (arg == "--visualize") opts.visualize = true;
+        else if (arg == "--rest-pose-ab-test")
+            opts.autoRestPoseTestSecondsPerPhase = std::stoi(next("--rest-pose-ab-test"));
+        else if (arg == "--rest-pose-variant-sweep")
+            opts.autoRestPoseVariantSweepSecondsPerPhase = std::stoi(next("--rest-pose-variant-sweep"));
         else if (arg == "--client-path") opts.clientPath = next("--client-path");
         else if (arg == "--dump-pob") opts.dumpPobPath = next("--dump-pob");
         else if (arg == "--list-files") opts.listFilesSubstring = next("--list-files");
@@ -1223,7 +1235,9 @@ void runDumpAnimJson(const CliOptions& opts) {
             << ", \"preRotation\": [" << b.preRotation.x << ", " << b.preRotation.y << ", "
             << b.preRotation.z << ", " << b.preRotation.w << "], \"postRotation\": ["
             << b.postRotation.x << ", " << b.postRotation.y << ", " << b.postRotation.z << ", "
-            << b.postRotation.w << "], \"bindTranslation\": [" << b.bindTranslation.x << ", "
+            << b.postRotation.w << "], \"bindPoseRotation\": [" << b.bindPoseRotation.x << ", "
+            << b.bindPoseRotation.y << ", " << b.bindPoseRotation.z << ", " << b.bindPoseRotation.w
+            << "], \"bindTranslation\": [" << b.bindTranslation.x << ", "
             << b.bindTranslation.y << ", " << b.bindTranslation.z << "]}";
         out << (i + 1 < skeleton.bones.size() ? ",\n" : "\n");
     }
@@ -1863,7 +1877,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         } else if (opts.visualize) {
             runVisualizer(zoneSession, zoneDispatcher, zoneFailed, objControllerDispatcher,
-                           objectStore, opts.clientPath, terrainName);
+                           objectStore, opts.clientPath, terrainName,
+                           opts.autoRestPoseTestSecondsPerPhase,
+                           opts.autoRestPoseVariantSweepSecondsPerPhase);
 #endif
         } else {
             observeMovement(zoneSession, zoneDispatcher, zoneFailed, objControllerDispatcher,
