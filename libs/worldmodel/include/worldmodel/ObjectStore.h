@@ -9,6 +9,7 @@
 #include "swgproto/DataTransform.h"
 #include "swgproto/DataTransformWithParent.h"
 #include "swgproto/ObjectStateDispatcher.h"
+#include "swgproto/PostureMessage.h"
 #include "swgproto/UpdateTransformMessage.h"
 #include "swgproto/UpdateTransformWithParentMessage.h"
 #include "worldmodel/ObjectVariant.h"
@@ -110,6 +111,15 @@ public:
     void applyDataTransform(uint64_t objectId, const swgproto::DataTransform& msg);
     void applyDataTransformWithParent(uint64_t objectId,
                                        const swgproto::DataTransformWithParent& msg);
+
+    // A creature's real posture (stance) changed - see PostureMessage.h's
+    // own comment. Same "silent no-op for an untracked/non-CreatureObject
+    // objectId" treatment as applyDataTransform() above. Updates
+    // `CreatureObject::base3->posture` directly rather than waiting on the
+    // next full baseline/delta sync, matching this project's existing
+    // DataTransform/DataTransformWithParent override pattern (see
+    // main.cpp's own registration of this).
+    void applyPostureMessage(uint64_t objectId, const swgproto::PostureMessage& msg);
 
     // Seeds an object's position+orientation from SceneCreateObjectByCrc -
     // the message Core3 sends for EVERY object as it spawns into view,

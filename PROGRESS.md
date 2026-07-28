@@ -160,3 +160,43 @@ worth stating plainly for anyone evaluating the codebase:
   bare, unanimated pose at all: the character is always playing a real,
   low-amplitude idle animation, even standing still, which reframes what
   the remaining open question even is.
+- **Follow-up: the resting-pose formula and correction values confirmed
+  correct against the real client's own leaked production source — and
+  a real, previously-unread animation-clip chunk found and fixed along
+  the way.** Genuine leaked source for the real client's own runtime
+  pose-computation code became available and was used to check several
+  standing assumptions directly rather than continuing to infer from
+  decoded file data alone. The formula this project already uses to
+  combine a bone's rest-orientation corrections with its animated
+  rotation is character-for-character identical to the real client's
+  own; the correction values themselves are confirmed genuine,
+  deliberately-authored rig data, not a decode artifact. Neither is the
+  cause. Fresh, deliberate side/back/front comparison screenshots
+  against the real client confirmed the resting stance really is a
+  continuous idle-gesture loop (tapping a foot, glancing around) —
+  but arm/leg placement reads as consistently wrong regardless of which
+  gesture is playing, ruling out a timing mismatch as the explanation.
+  Reading the real client's own skeleton-file loading code directly,
+  chunk by chunk, found that every piece of data that file format can
+  contain is already read and used by this project — the format itself
+  is now fully exhausted, not just deprioritized. That same pass
+  surfaced a genuinely new, previously-unread piece of the *animation
+  clip* format instead: a bone with no explicit animated motion in a
+  given clip doesn't default to "unchanged," as this project had
+  assumed — the format stores a real, fixed, deliberately-authored
+  resting value for it. That gap was closed (decoded, wired in, covered
+  by new automated tests against real content, live-verified end to
+  end) — a genuine, previously-missing piece of real per-character
+  animation data, correctly restored for the first time. **It did not
+  fix the resting-pose difference.** The newly-restored values are, like
+  the animated motion measured earlier, only a few tens of degrees at
+  most — real and correct, but still nowhere near the roughly
+  quarter-turn a shoulder would need to travel to reach a natural
+  at-the-sides stance from this project's own computed rest
+  configuration. Both relevant file formats are now genuinely exhausted;
+  whatever explains the real client's actual resting configuration
+  isn't per-clip animation data at all. This is, by a clear margin, the
+  most thoroughly investigated open defect in this project's history,
+  and the internally-visible leads are exhausted — if this describes a
+  symptom you recognize from real hands-on experience with this
+  platform's animation pipeline, please open an issue.

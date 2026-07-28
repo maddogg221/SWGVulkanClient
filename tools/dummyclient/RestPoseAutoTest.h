@@ -19,8 +19,8 @@ namespace dummyclient {
 // directly through the same AnimationDebugControls/ScreenshotCapture state
 // the 'K'/'U'/'V'/'P' keys already drive, no OS input injection involved.
 //
-// Two mutually-exclusive modes (only one CLI flag is ever passed at a
-// time), both captured to a locked camera angle:
+// Three mutually-exclusive modes (only one CLI flag is ever passed at a
+// time), all captured to a locked camera angle:
 //   - formulaSecondsPerPhase > 0: A/B tests the old two-term vs. real
 //     three-term bind-pose formula (see AnimationDebugControls::
 //     useRealBindPoseFormula), capturing to diagnostic_screenshots/
@@ -28,14 +28,22 @@ namespace dummyclient {
 //   - variantSweepSecondsPerPhase > 0: sweeps all 6
 //     rotationCompositionVariant values, capturing to
 //     diagnostic_screenshots/restpose_variant_<N>/.
+//   - bindAxisSweepSecondsPerPhase > 0: sweeps all 7
+//     bindRotationAxisFixVariant values (see AnimationDebugControls::
+//     bindRotationAxisFixVariant), capturing to diagnostic_screenshots/
+//     restpose_bindaxis_<N>/.
 class RestPoseAutoTest {
 public:
-    RestPoseAutoTest(int formulaSecondsPerPhase, int variantSweepSecondsPerPhase);
+    RestPoseAutoTest(int formulaSecondsPerPhase, int variantSweepSecondsPerPhase,
+                      int bindAxisSweepSecondsPerPhase = 0);
 
     // False (the common case) means neither CLI flag was passed - drive()
     // should never be called, and complete() will always be false, so the
     // caller's own `!complete()` loop condition never forces an exit.
-    bool enabled() const { return formulaSecondsPerPhase_ > 0 || variantSweepSecondsPerPhase_ > 0; }
+    bool enabled() const {
+        return formulaSecondsPerPhase_ > 0 || variantSweepSecondsPerPhase_ > 0 ||
+               bindAxisSweepSecondsPerPhase_ > 0;
+    }
 
     // Once true, the requested auto-test has finished every phase - the
     // caller (runVisualizer's main loop) should end the render loop.
@@ -50,6 +58,7 @@ public:
 private:
     int formulaSecondsPerPhase_;
     int variantSweepSecondsPerPhase_;
+    int bindAxisSweepSecondsPerPhase_;
     std::chrono::steady_clock::time_point startTime_;
     bool complete_ = false;
     int lastPhaseLogged_ = -1;

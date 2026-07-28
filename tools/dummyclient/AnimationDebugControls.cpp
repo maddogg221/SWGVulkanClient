@@ -142,6 +142,14 @@ void AnimationDebugControls::processFrameInput(
     }
     realBindPoseKeyWasDown_ = realBindPoseKeyDown;
 
+    bool bindRotationAxisFixKeyDown = renderer::Window::isKeyDown('Y');
+    if (bindRotationAxisFixKeyDown && !bindRotationAxisFixKeyWasDown_) {
+        bindRotationAxisFixVariant = (bindRotationAxisFixVariant + 1) % 7;
+        std::cout << "[VISUALIZER] self bind-rotation-axis-fix-variant = " << bindRotationAxisFixVariant
+                   << "\n";
+    }
+    bindRotationAxisFixKeyWasDown_ = bindRotationAxisFixKeyDown;
+
     bool isolateBoneKeyDown = renderer::Window::isKeyDown('M');
     if (isolateBoneKeyDown && !isolateBoneKeyWasDown_) {
         isolateBoneCount = (isolateBoneCount + 1) % (kIsolateBoneChainLen + 1);

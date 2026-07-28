@@ -50,10 +50,20 @@ class ObjectStore;
 // resolves to a real, active idle-breathing clip, not literal bind pose).
 // Captures each variant's burst into diagnostic_screenshots/
 // restpose_variant_<N>/, `secondsPerPhase` real seconds each, then exits.
+// `autoRestPoseBindAxisSweepSecondsPerPhase` (0 = disabled): same idea again,
+// sweeping `bindRotationAxisFixVariant` (normally the `'Y'` key, see
+// SkeletalPose.h's own comment) through all 7 values - tests whether the
+// same class of axis-convention correction already found necessary for
+// ANIMATED per-frame quaternion channels also applies to the STATIC
+// preRotation/postRotation/bindPoseRotation quaternions, never tested
+// before since legs (the only bones independently cross-validated so far)
+// have exactly-identity values there, which would hide such a bug entirely.
+// Captures into diagnostic_screenshots/restpose_bindaxis_<N>/.
 void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatcher, bool& failed,
                     swgproto::ObjControllerDispatcher& objControllerDispatcher,
                     const worldmodel::ObjectStore& objectStore, const std::string& clientPath,
                     const std::string& terrainName, int autoRestPoseTestSecondsPerPhase = 0,
-                    int autoRestPoseVariantSweepSecondsPerPhase = 0);
+                    int autoRestPoseVariantSweepSecondsPerPhase = 0,
+                    int autoRestPoseBindAxisSweepSecondsPerPhase = 0);
 
 #endif

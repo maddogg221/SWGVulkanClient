@@ -117,8 +117,9 @@ std::vector<int> bindClipBoneIndices(const assets::SkeletonData& skeleton,
 // after finding a real, previously-unread `.skt` chunk (`BPRO` -
 // `bindPoseRotation`, one quaternion per bone) by reading the real original
 // client source (a 2015 leak of Sony Online Entertainment's own code,
-// confirmed genuine via literal copyright headers). The real client
-// composes a bone's local rotation as
+// confirmed genuine via literal copyright headers - see project memory
+// project_animation_phase21_inprogress.md's "v3" section for the full
+// account). The real client composes a bone's local rotation as
 // `postRotation * (animatedRotation * preRotation)` where `animatedRotation
 // = animationResolverRotation * bindPoseRotation` (animationResolverRotation
 // = identity for bind pose, or the clip's own decoded rotation when
@@ -134,12 +135,36 @@ std::vector<int> bindClipBoneIndices(const assets::SkeletonData& skeleton,
 // bypasses `rotationCompositionVariant`/`axisFixVariant`/the finger
 // overrides entirely when true, since those were empirically tuned against
 // the OLD two-term formula and are not known to still apply.
+// `bindRotationAxisFixVariant` - an eighth live-debug aid, added 2026-07-28
+// during the rest-pose investigation. Every prior `axisFixVariant`/Z-negation
+// fix (see AnimationClip.cpp's own comment on the real, already-shipped
+// Z-negation correction) was found and tested against ANIMATED per-frame
+// QCHN channel data specifically - never against the STATIC per-bone
+// `preRotation`/`postRotation`/`bindPoseRotation` float quaternions read
+// directly in Skeleton.cpp (RPRE/RPST/BPRO), which are used completely raw.
+// Real byte ORDER for those was confirmed correct against the leaked
+// source's own writer, but byte order and axis CONVENTION are separate
+// questions - this tests whether the same class of axis-convention mismatch
+// applies here too. Real motivation: legs have exactly-identity
+// preRotation/postRotation/bindPoseRotation for every bone checked (so any
+// axis-convention bug in this data would be completely invisible for legs,
+// explaining why the independent Blender cross-check - which only exercised
+// leg/root/spine bones with identity correction data - never caught it),
+// while arms have real, large, non-identity postRotation (~180°, confirmed
+// legitimate Maya JointOrient data, not a decode bug) that WOULD expose
+// such a bug if one exists. 0 = no change (default, current shipped
+// behavior). 1-3 = negate x/y/z, 4 = negate x,y,z (conjugate), 5 = swap y,z,
+// 6 = swap y,z and negate the result's z - same scheme as `axisFixVariant`,
+// applied to `preRotation`/`postRotation`/`bindPoseRotation` themselves
+// (every bone, before any formula/composition runs) rather than to the
+// decoded animated rotation.
 std::vector<DirectX::XMMATRIX> sampleLocalBoneTransforms(
     const assets::SkeletonData& skeleton, const assets::AnimationClipData* clip,
     const std::vector<int>& clipBoneIndexForSkeletonBone, float timeSeconds,
     int rotationCompositionVariant = 0, int axisFixVariant = 0, bool disableAnimTranslation = false,
     const std::vector<std::string>* isolateBoneNames = nullptr, int fingerCompositionVariantOverride = -1,
-    int fingerAxisFixVariantOverride = -1, bool useRealBindPoseFormula = false);
+    int fingerAxisFixVariantOverride = -1, bool useRealBindPoseFormula = false,
+    int bindRotationAxisFixVariant = 0);
 
 // Walks the skeleton hierarchy (SkeletonBone::parentIndex - every real
 // skeleton checked this project always lists a bone's parent at an earlier
@@ -187,6 +212,6 @@ void skinSubmeshVertices(const assets::SkeletalMeshSubmesh& submesh,
                           const std::vector<DirectX::XMMATRIX>& worldBoneTransforms,
                           std::vector<assets::Float3>& outPositions,
                           std::vector<assets::Float3>& outNormals,
-                          bool useRealBindPoseFormula = false);
+                          bool useRealBindPoseFormula = false, int bindRotationAxisFixVariant = 0);
 
 } // namespace animation

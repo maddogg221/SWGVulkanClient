@@ -107,6 +107,14 @@ public:
     // axisFixVariant/finger-override value above entirely when on. 'U' key.
     bool useRealBindPoseFormula = false;
 
+    // Phase 21 (animation) diagnostic - cycles a real axis-convention
+    // correction applied to the STATIC per-bone preRotation/postRotation/
+    // bindPoseRotation quaternions themselves (see animation::
+    // sampleLocalBoneTransforms's own comment on
+    // `bindRotationAxisFixVariant`) - a different thing from `axisFixVariant`
+    // above, which only ever corrects the decoded ANIMATED rotation. 'Y' key.
+    int bindRotationAxisFixVariant = 0;
+
     // Phase 21 (animation) diagnostic - cumulative bone-isolation chain:
     // the first `isolateBoneCount` bones of the real chain below are the
     // only ones allowed to use their real animated rotation; every other
@@ -135,6 +143,7 @@ private:
     bool fingerGKeyWasDown_ = false;
     bool fingerHKeyWasDown_ = false;
     bool realBindPoseKeyWasDown_ = false;
+    bool bindRotationAxisFixKeyWasDown_ = false;
     bool isolateBoneKeyWasDown_ = false;
 };
 

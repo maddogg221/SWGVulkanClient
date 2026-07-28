@@ -37,6 +37,7 @@
 #include "swgproto/ClientCreateCharacterSuccess.h"
 #include "swgproto/DataTransform.h"
 #include "swgproto/DataTransformWithParent.h"
+#include "swgproto/PostureMessage.h"
 #include "swgproto/ClientIdMessage.h"
 #include "swgproto/ClientPermissionsMessage.h"
 #include "swgproto/ClientRandomNameRequestPacket.h"
@@ -967,6 +968,9 @@ struct CliOptions {
     // Same idea, sweeping rotationCompositionVariant (0-5) instead - see
     // runVisualizer's own comment on autoRestPoseVariantSweepSecondsPerPhase.
     int autoRestPoseVariantSweepSecondsPerPhase = 0;
+    // Same idea again, sweeping bindRotationAxisFixVariant (0-6) - see
+    // runVisualizer's own comment on autoRestPoseBindAxisSweepSecondsPerPhase.
+    int autoRestPoseBindAxisSweepSecondsPerPhase = 0;
 
     // Real SWG client install directory - used by the visualizer's
     // RealMeshResolver to open real .tre archives and render actual
@@ -1040,6 +1044,8 @@ CliOptions parseCommandLine(int argc, char** argv) {
             opts.autoRestPoseTestSecondsPerPhase = std::stoi(next("--rest-pose-ab-test"));
         else if (arg == "--rest-pose-variant-sweep")
             opts.autoRestPoseVariantSweepSecondsPerPhase = std::stoi(next("--rest-pose-variant-sweep"));
+        else if (arg == "--rest-pose-bindaxis-sweep")
+            opts.autoRestPoseBindAxisSweepSecondsPerPhase = std::stoi(next("--rest-pose-bindaxis-sweep"));
         else if (arg == "--client-path") opts.clientPath = next("--client-path");
         else if (arg == "--dump-pob") opts.dumpPobPath = next("--dump-pob");
         else if (arg == "--list-files") opts.listFilesSubstring = next("--list-files");
@@ -1245,7 +1251,10 @@ void runDumpAnimJson(const CliOptions& opts) {
     out << "  \"clipBones\": [\n";
     for (size_t i = 0; i < clip.bones.size(); ++i) {
         const auto& cb = clip.bones[i];
-        out << "    {\"boneName\": \"" << jsonEscape(cb.boneName) << "\", \"rotationKeyframes\": [\n";
+        out << "    {\"boneName\": \"" << jsonEscape(cb.boneName) << "\", \"hasStaticRotation\": "
+            << (cb.hasStaticRotation ? "true" : "false") << ", \"staticRotation\": [" << cb.staticRotation.x
+            << ", " << cb.staticRotation.y << ", " << cb.staticRotation.z << ", " << cb.staticRotation.w
+            << "], \"rotationKeyframes\": [\n";
         for (size_t k = 0; k < cb.rotationKeyframes.size(); ++k) {
             const auto& kf = cb.rotationKeyframes[k];
             out << "      {\"frame\": " << kf.frame << ", \"rotation\": [" << kf.rotation.x << ", "
@@ -1733,6 +1742,18 @@ int main(int argc, char** argv) {
                            << ", " << dtp.z << ") speed=" << dtp.speed << "\n";
                 objectStore.applyDataTransformWithParent(envelope.objectId, dtp);
             });
+        // PostureMessage -> ObjectStore, same override reasoning as the two
+        // DataTransform handlers above - closes the last open item from the
+        // Phase 21 plan's own Step 6b (explicit posture changes now update
+        // immediately instead of waiting on the next baseline/delta sync).
+        objControllerDispatcher.on(
+            swgproto::kPostureMessageControllerType,
+            [&objectStore](const swgproto::ObjControllerMessage& envelope, soe::PacketBuffer& buf) {
+                auto pm = swgproto::PostureMessage::parse(buf);
+                std::cout << "ObjController PostureMessage: objectId=" << envelope.objectId
+                           << " posture=" << static_cast<int>(pm.posture) << "\n";
+                objectStore.applyPostureMessage(envelope.objectId, pm);
+            });
 
         zoneDispatcher.on(swgproto::kBaselinesMessageHash,
                            [&objectStateDispatcher](soe::PacketBuffer& buf) {
@@ -1879,7 +1900,8 @@ int main(int argc, char** argv) {
             runVisualizer(zoneSession, zoneDispatcher, zoneFailed, objControllerDispatcher,
                            objectStore, opts.clientPath, terrainName,
                            opts.autoRestPoseTestSecondsPerPhase,
-                           opts.autoRestPoseVariantSweepSecondsPerPhase);
+                           opts.autoRestPoseVariantSweepSecondsPerPhase,
+                           opts.autoRestPoseBindAxisSweepSecondsPerPhase);
 #endif
         } else {
             observeMovement(zoneSession, zoneDispatcher, zoneFailed, objControllerDispatcher,

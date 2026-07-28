@@ -37,6 +37,20 @@ struct AnimationBoneChannel {
     std::string boneName;
     std::vector<QuaternionKeyframe> rotationKeyframes;
     std::vector<ScalarKeyframe> translationAxis[3];
+    // Real per-clip FIXED rotation for a bone this clip doesn't animate
+    // (`rotationKeyframes` empty, XFIN's `hasRotation==0`) - confirmed
+    // 2026-07-28 directly against the leaked original
+    // CompressedKeyframeAnimationTemplate::getStaticRotation /
+    // TransformInfo::m_hasAnimatedRotation source: XFIN's rotation-channel
+    // index means EITHER "index into AROT's QCHN channels" (hasRotation!=0)
+    // OR "index into CHNK SROT's static-rotation array" (hasRotation==0) -
+    // never "unused", as this project previously assumed (silently treating
+    // every non-animated bone as identity/no-delta-from-bind-pose, which
+    // the real client only does when an appearance has NO animation
+    // controller at all, not per-bone). `false` for a real "hardpoint"
+    // attachment bone (e.g. `sword`/`hold_r`), which genuinely has neither.
+    bool hasStaticRotation = false;
+    Quaternion staticRotation;
 };
 
 // One real locomotion-curve keyframe from a real CHNK LOCT (see
@@ -55,8 +69,12 @@ struct LocomotionKeyframe {
 // fields incl. frame rate - not decoded/needed this phase) + FORM(XFRM)
 // (real per-bone CHNK XFIN records, name + channel-index data) +
 // FORM(AROT) (real per-bone-i-animated-bone CHNK QCHN rotation-keyframe
-// channels) + CHNK SROT (49 bytes, likely default/rest rotations for
-// unanimated bones - not decoded) + FORM(ATRN) (real per-axis CHNK CHNL
+// channels) + CHNK SROT (a real, fixed-per-entry-size array - 3 context
+// bytes + a uint32 quantized rotation payload per entry, same "smallest
+// three" encoding as a QCHN keyframe - real per-clip STATIC rotations for
+// bones this clip doesn't animate; confirmed and decoded 2026-07-28, see
+// AnimationBoneChannel's own `hasStaticRotation` comment) + FORM(ATRN)
+// (real per-axis CHNK CHNL
 // translation-keyframe channels, only ever 3 total in samples checked -
 // one clip only ever animates one bone's translation, `root`) +
 // CHNK STRN (real per-bone scale-channel floats, confirmed all-zero/unused

@@ -296,6 +296,23 @@ std::string selectAnimationClip(const AnimationNode& root, const AnimationSelect
                         }
                     }
                 }
+                // Real "mood" switch - same mechanism as gender above, just
+                // a different real parameter name/context value. No
+                // subtree-scan fallback for mood (that heuristic is
+                // specifically a gender-content-detection trick, see
+                // subtreeHasGenderHint's own comment) - an unmatched real
+                // mood value just falls through to switchDefaultIndex like
+                // any other unresolved switch.
+                bool isMoodSwitch =
+                    !isGenderSwitch && equalsIgnoreCase(node->parameterName, "mood") && !context.mood.empty();
+                if (isMoodSwitch) {
+                    for (const auto& valueEntry : node->switchValueMap) {
+                        if (equalsIgnoreCase(valueEntry.first, context.mood)) {
+                            selectedIndex = valueEntry.second;
+                            break;
+                        }
+                    }
+                }
                 if (selectedIndex < 0 && node->switchDefaultIndex >= 0) {
                     selectedIndex = node->switchDefaultIndex;
                 }

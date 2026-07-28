@@ -87,6 +87,10 @@ add_subdirectory(libs/clientcommon)
 add_subdirectory(libs/worldmodel)
 add_subdirectory(libs/assets)
 add_subdirectory(libs/terrain)
+# Bridges worldmodel::CreatureObject to assets::AnimationSelectionContext -
+# needs neither libs/animation (pose math) nor Vulkan/rendering, so unlike
+# those it isn't gated behind the WIN32 Vulkan block below.
+add_subdirectory(libs/creatureanim)
 if(WIN32)
     # Vulkan is the decided production rendering engine (2026-07-18, see
     # DISCOVERY.txt's "DIRECTION DISCUSSION"), replacing the throwaway D3D11

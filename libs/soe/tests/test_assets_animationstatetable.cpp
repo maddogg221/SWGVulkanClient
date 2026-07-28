@@ -90,3 +90,43 @@ TEST_CASE("AnimationStateTable: parses real named animation states from a real .
     CHECK(selectAnimationClip(standIt->root, maleCtx, true) ==
           "appearance/animation/all_b_loc_walk_male.ans");
 }
+
+// Synthetic-tree test for the "mood" Switch mechanism added alongside
+// creatureanim - doesn't need the real client install, since it's testing
+// the SAME already-proven VALS/DFLT lookup mechanism (see gender's own
+// test above) applied to a second real parameter name, not new parsing
+// logic. Builds a small in-memory tree by hand rather than a real .lat
+// file.
+TEST_CASE("selectAnimationClip: real mood Switch, same VALS/DFLT mechanism as gender") {
+    AnimationNode calmClip;
+    calmClip.kind = AnimationNodeKind::Clip;
+    calmClip.clipPath = "appearance/animation/all_b_idl_breathe_calmly.ans";
+
+    AnimationNode angryClip;
+    angryClip.kind = AnimationNodeKind::Clip;
+    angryClip.clipPath = "appearance/animation/all_b_idl_breathe_angry.ans";
+
+    AnimationNode moodSwitch;
+    moodSwitch.kind = AnimationNodeKind::Switch;
+    moodSwitch.parameterName = "mood";
+    moodSwitch.switchValueMap = {{"calm", 0}, {"angry", 1}};
+    moodSwitch.switchDefaultIndex = 0;
+    moodSwitch.children = {calmClip, angryClip};
+
+    AnimationSelectionContext angryCtx;
+    angryCtx.mood = "angry";
+    CHECK(selectAnimationClip(moodSwitch, angryCtx, false) ==
+          "appearance/animation/all_b_idl_breathe_angry.ans");
+
+    // Real value not present in switchValueMap - falls back to
+    // switchDefaultIndex, same as gender's own unmatched-value fallback.
+    AnimationSelectionContext unknownMoodCtx;
+    unknownMoodCtx.mood = "berserk";
+    CHECK(selectAnimationClip(moodSwitch, unknownMoodCtx, false) ==
+          "appearance/animation/all_b_idl_breathe_calmly.ans");
+
+    // No mood known at all - same DFLT fallback.
+    AnimationSelectionContext noMoodCtx;
+    CHECK(selectAnimationClip(moodSwitch, noMoodCtx, false) ==
+          "appearance/animation/all_b_idl_breathe_calmly.ans");
+}

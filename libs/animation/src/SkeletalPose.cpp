@@ -166,13 +166,37 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                                                  const std::vector<std::string>* isolateBoneNames,
                                                  int fingerCompositionVariantOverride,
                                                  int fingerAxisFixVariantOverride,
-                                                 bool useRealBindPoseFormula) {
+                                                 bool useRealBindPoseFormula,
+                                                 int bindRotationAxisFixVariant) {
     std::vector<XMMATRIX> result(skeleton.bones.size());
     for (size_t i = 0; i < skeleton.bones.size(); ++i) {
         const SkeletonBone& bone = skeleton.bones[i];
         XMVECTOR preRot = toXMQuat(bone.preRotation);
         XMVECTOR postRot = toXMQuat(bone.postRotation);
         XMVECTOR bindPoseRot = toXMQuat(bone.bindPoseRotation);
+        // Phase 21 live experiment (2026-07-28) - see
+        // bindRotationAxisFixVariant's own header comment. Same axis-fix
+        // switch shape as the animated-rotation one below, applied to the
+        // STATIC per-bone correction quaternions instead.
+        if (bindRotationAxisFixVariant != 0) {
+            auto applyAxisFix = [bindRotationAxisFixVariant](XMVECTOR q) {
+                XMFLOAT4 v;
+                XMStoreFloat4(&v, q);
+                switch (bindRotationAxisFixVariant) {
+                    case 1: v.x = -v.x; break;
+                    case 2: v.y = -v.y; break;
+                    case 3: v.z = -v.z; break;
+                    case 4: v.x = -v.x; v.y = -v.y; v.z = -v.z; break;
+                    case 5: std::swap(v.y, v.z); break;
+                    case 6: std::swap(v.y, v.z); v.z = -v.z; break;
+                    default: break;
+                }
+                return XMVectorSet(v.x, v.y, v.z, v.w);
+            };
+            preRot = applyAxisFix(preRot);
+            postRot = applyAxisFix(postRot);
+            bindPoseRot = applyAxisFix(bindPoseRot);
+        }
         XMVECTOR animRot = XMQuaternionIdentity();
         bool hasAnimRot = false;
         XMVECTOR translation =
@@ -198,6 +222,23 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                 animRot = sampleRotationChannel(channel.rotationKeyframes, timeSeconds,
                                                  XMQuaternionIdentity());
                 hasAnimRot = true;
+            } else if (channel.hasStaticRotation) {
+                // Phase 21 finding (2026-07-28): a bone this clip doesn't
+                // animate is NOT identity/no-delta-from-bind-pose - the
+                // real client stores a genuine per-clip STATIC rest
+                // rotation for it instead (CHNK SROT, see
+                // AnimationBoneChannel::hasStaticRotation's own comment).
+                // Applying it here means bones like lWrist/lUlna (confirmed
+                // to have no animated rotation channel in the idle-breathe
+                // clip - see project_animation_phase21_inprogress.md's
+                // "Fourth session" section) get their real authored rest
+                // offset instead of silently staying at raw `.skt` bind
+                // pose for the bone's own local rotation.
+                animRot = XMVectorSet(channel.staticRotation.x, channel.staticRotation.y,
+                                       channel.staticRotation.z, channel.staticRotation.w);
+                hasAnimRot = true;
+            }
+            if (hasAnimRot) {
                 // Phase 21 live experiment: fingerAxisFixVariantOverride
                 // lets finger-chain bones specifically use a DIFFERENT
                 // axisFixVariant than every other bone - live evidence
@@ -458,17 +499,19 @@ void skinSubmeshVertices(const SkeletalMeshSubmesh& submesh,
                           const std::vector<std::string>& meshBoneNames,
                           const std::vector<XMMATRIX>& worldBoneTransforms,
                           std::vector<Float3>& outPositions, std::vector<Float3>& outNormals,
-                          bool useRealBindPoseFormula) {
+                          bool useRealBindPoseFormula, int bindRotationAxisFixVariant) {
     outPositions.resize(submesh.positions.size());
     outNormals.resize(submesh.normals.size());
 
     // Bind pose (clip == nullptr) world matrices, needed to build each
-    // mesh bone's inverse bind pose. Must use the same useRealBindPoseFormula
-    // choice as whatever built worldBoneTransforms (see this function's own
-    // header comment in SkeletalPose.h) - otherwise invBind(bindPose) *
-    // worldBoneTransforms would mix two different conventions.
+    // mesh bone's inverse bind pose. Must use the same useRealBindPoseFormula/
+    // bindRotationAxisFixVariant choice as whatever built worldBoneTransforms
+    // (see this function's own header comment in SkeletalPose.h) - otherwise
+    // invBind(bindPose) * worldBoneTransforms would mix two different
+    // conventions.
     std::vector<XMMATRIX> bindLocal = sampleLocalBoneTransforms(
-        skeleton, nullptr, {}, 0.0f, 0, 0, false, nullptr, -1, -1, useRealBindPoseFormula);
+        skeleton, nullptr, {}, 0.0f, 0, 0, false, nullptr, -1, -1, useRealBindPoseFormula,
+        bindRotationAxisFixVariant);
     std::vector<XMMATRIX> bindWorld = computeWorldBoneTransforms(skeleton, bindLocal);
 
     // Real bug found live (Phase 21): sizing this purely off the highest
@@ -511,7 +554,7 @@ void skinSubmeshVertices(const SkeletalMeshSubmesh& submesh,
     //       multiple frames, WITH real seam-continuity checks between
     //       adjacent bones (all passed, small real gaps, no tears) - and
     //       STILL made the live result worse, not better, when actually
-    //       tested against a live private test server.
+    //       tested against Naritus.
     // v2's real, most likely bug, understood only after the fact: this
     // correction is computed independently INSIDE each separate call to
     // `skinSubmeshVertices` - one call per body-part submesh (body, arms,
@@ -532,7 +575,8 @@ void skinSubmeshVertices(const SkeletalMeshSubmesh& submesh,
     // ONCE across all body parts together (not independently per
     // `skinSubmeshVertices` call) - and must be validated across
     // multiple body parts together, not one mesh file at a time, before
-    // ever going live again.
+    // ever going live again. See [[project_animation_phase21_inprogress]]
+    // for the full account of both attempts.
 
     // Real bug found live (Phase 21): real facial-feature mesh bones
     // (jaw/eyes/lids/brows/lips - see isFacialFeatureBone above) have no

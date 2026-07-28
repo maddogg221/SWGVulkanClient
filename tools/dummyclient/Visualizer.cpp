@@ -13,6 +13,7 @@
 #include "AnimationDebugControls.h"
 #include "AnimationDiagnosticLogging.h"
 #include "PngWriter.h"
+#include "creatureanim/AnimationStateSelection.h"
 #include "RestPoseAutoTest.h"
 #include "ScreenshotCapture.h"
 #include "StringUtil.h"
@@ -1381,44 +1382,22 @@ private:
     std::unordered_map<uint32_t, std::string> crcToTemplatePath_;
 };
 
-// Phase 21 (animation), v1 - small, explicitly extensible posture/
-// locomotion -> real .lat state name map. Real transition clips
-// (trn_standing_to_kneeling etc., confirmed present in the real state
-// table) are deliberately not wired up yet - hard cuts between states are
-// fine for v1, per explicit direction; swapping to something richer only
-// needs this function (plus playing a transition clip first) touched, not
-// a redesign. Real posture values per swgproto::PostureMessage.h's own
-// doc: 0=upright, 1=crouched, 2=prone, 3=sneaking, 8=sitting,
-// 9=skill-animating - postures 3/9 aren't mapped to a dedicated real state
-// yet, falling back to standing.
-const char* selfAnimationStateNameFor(uint8_t posture, bool isMoving) {
-    if (isMoving && posture == 0) {
-        // "loop_combat_standing" is a real SPAT-variant state whose own
-        // first real clip (appearance/animation/all_b_loc_walk_male.ans) is
-        // the walk cycle - confirmed via a real dump this session. Despite
-        // the "combat" name, the clip itself is generically named/usable
-        // for ordinary walking.
-        return "loop_combat_standing";
-    }
-    switch (posture) {
-        case 1: return "loop_kneeling";
-        case 2: return "loop_prone";
-        case 8: return "loop_sitting_chair";
-        default: return "loop_standing";
-    }
-}
+// Phase 21 (animation) - real posture/locomotion/mood/weapon -> `.lat`
+// state name mapping now lives in creatureanim::stateNameFor (see
+// libs/creatureanim/include/creatureanim/AnimationStateSelection.h),
+// generalized from this file's own original self-only version.
 
 // Looks up `stateName`'s real selected clip path in `table`, walking the
-// state's own real selection tree (gender-branched, mood-varianted -
-// see AnimationStateTable.h's own comment) rather than blindly taking
+// state's own real selection tree (gender- and mood-branched - see
+// AnimationStateTable.h's own comment) rather than blindly taking
 // whichever real clip a naive flatten happened to find first. Empty
 // string if the state isn't found.
 std::string selfClipPathForState(const assets::AnimationStateTableData& table, const char* stateName,
-                                  const std::string& gender, bool preferLocomotion) {
+                                  const assets::AnimationSelectionContext& selectionContext,
+                                  bool preferLocomotion) {
     for (const auto& state : table.states) {
         if (state.name == stateName) {
-            return assets::selectAnimationClip(state.root, assets::AnimationSelectionContext{gender},
-                                                preferLocomotion);
+            return assets::selectAnimationClip(state.root, selectionContext, preferLocomotion);
         }
     }
     return {};
@@ -2371,7 +2350,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     swgproto::ObjControllerDispatcher& objControllerDispatcher,
                     const worldmodel::ObjectStore& objectStore, const std::string& clientPath,
                     const std::string& terrainName, int autoRestPoseTestSecondsPerPhase,
-                    int autoRestPoseVariantSweepSecondsPerPhase) {
+                    int autoRestPoseVariantSweepSecondsPerPhase,
+                    int autoRestPoseBindAxisSweepSecondsPerPhase) {
     // kObjControllerMessageHash forwarding is no longer registered locally
     // here - main() now owns it permanently (see its 2026-07-18 fix comment).
     renderer::Window window(1920, 1080, L"SWG Client - Crude Visualizer");
@@ -2462,7 +2442,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     dummyclient::AnimationDebugControls animControls;
     dummyclient::ScreenshotCapture screenshotCapture;
     dummyclient::RestPoseAutoTest autoTest(autoRestPoseTestSecondsPerPhase,
-                                            autoRestPoseVariantSweepSecondsPerPhase);
+                                            autoRestPoseVariantSweepSecondsPerPhase,
+                                            autoRestPoseBindAxisSweepSecondsPerPhase);
 
     // Player movement (Phase 13) - a LOCALLY predicted position/facing,
     // driven by WASD input every frame and only ever seeded ONCE from
@@ -3437,19 +3418,33 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     }
 
                     if (obj.isSelf && selfAnimData.has_value() && !selfAnimData->meshParts.empty()) {
-                        uint8_t posture = 0;
+                        // Real posture/mood/weapon/combat-state context -
+                        // see creatureanim::CreatureAnimationContext's own
+                        // comment. Falls back to the struct's own defaults
+                        // (posture=0 etc.) for any self-typed object that
+                        // isn't a real CreatureObject.
+                        creatureanim::CreatureAnimationContext animContext;
                         if constexpr (std::is_same_v<T, worldmodel::CreatureObject>) {
-                            if (obj.base3.has_value()) posture = obj.base3->posture;
+                            animContext = creatureanim::resolveAnimationContext(obj, selfIsMoving);
+                        } else {
+                            animContext.isMoving = selfIsMoving;
                         }
-                        const char* stateName = selfAnimationStateNameFor(posture, selfIsMoving);
+                        const char* stateName = creatureanim::stateNameFor(animContext);
 
                         if (!selfAnimData->stateTable.states.empty()) {
                             auto cacheIt = selfClipCache.find(stateName);
                             if (cacheIt == selfClipCache.end()) {
+                                assets::AnimationSelectionContext selectionContext =
+                                    creatureanim::toSelectionContext(animContext, selfAnimData->gender);
                                 std::string clipPath = selfClipPathForState(
-                                    selfAnimData->stateTable, stateName, selfAnimData->gender, selfIsMoving);
-                                std::cout << "[ANIMDBG] resolved clip for state=" << stateName << ": "
-                                           << clipPath << "\n";
+                                    selfAnimData->stateTable, stateName, selectionContext, selfIsMoving);
+                                std::cout << "[ANIMDBG] resolved clip for state=" << stateName
+                                           << " (posture=" << static_cast<int>(animContext.posture)
+                                           << " mood=" << animContext.moodString
+                                           << " weaponId=" << animContext.weaponId
+                                           << " stateBitmask=" << creatureanim::describeStateBitmask(
+                                                                       animContext.stateBitmask)
+                                           << "): " << clipPath << "\n";
                                 std::optional<assets::AnimationClipData> clip;
                                 if (!clipPath.empty()) {
                                     clip = skeletalMeshResolver.resolveAnimationClip(clipPath);
@@ -3478,7 +3473,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                 animControls.rotationCompositionVariant, animControls.axisFixVariant,
                                 animControls.disableAnimTranslation, &animControls.isolateBoneNames,
                                 animControls.fingerCompositionVariant, animControls.fingerAxisFixVariant,
-                                animControls.useRealBindPoseFormula);
+                                animControls.useRealBindPoseFormula,
+                                animControls.bindRotationAxisFixVariant);
                             auto worldTransforms =
                                 animation::computeWorldBoneTransforms(selfAnimData->skeleton, localTransforms);
 
@@ -3526,7 +3522,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                                         submesh, part.vertexWeights, selfAnimData->skeleton,
                                         meshBoneIndices, part.boneNames, worldTransforms,
                                         skinnedPositions, skinnedNormals,
-                                        animControls.useRealBindPoseFormula);
+                                        animControls.useRealBindPoseFormula,
+                                        animControls.bindRotationAxisFixVariant);
                                     // Real per-submesh skinned-mesh
                                     // diagnostics - see
                                     // AnimationDiagnosticLogging's own

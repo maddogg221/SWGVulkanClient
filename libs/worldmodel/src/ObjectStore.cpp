@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <type_traits>
 
 #include "swgproto/CellObjectBaseline3.h"
 #include "swgproto/CellObjectBaseline6.h"
@@ -618,6 +619,24 @@ void ObjectStore::applyDataTransformWithParent(uint64_t objectId,
     obj.quatW = msg.directionW;
     ++obj.dataTransformMessagesSeen;
     obj.lastDataTransformUpdate = std::chrono::steady_clock::now();
+}
+
+void ObjectStore::applyPostureMessage(uint64_t objectId, const swgproto::PostureMessage& msg) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = objects_.find(objectId);
+    if (it == objects_.end()) {
+        return;
+    }
+    std::visit(
+        [&](auto& o) {
+            using T = std::decay_t<decltype(o)>;
+            if constexpr (std::is_same_v<T, CreatureObject>) {
+                if (o.base3.has_value()) {
+                    o.base3->posture = msg.posture;
+                }
+            }
+        },
+        it->second);
 }
 
 void ObjectStore::seedPosition(uint64_t objectId, float x, float y, float z, float quatX,

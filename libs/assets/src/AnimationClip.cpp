@@ -19,6 +19,7 @@ constexpr uint32_t kQchnTag = 0x5143484E; // 'QCHN'
 constexpr uint32_t kAtrnTag = 0x4154524E; // 'ATRN'
 constexpr uint32_t kChnlTag = 0x43484E4C; // 'CHNL'
 constexpr uint32_t kLoctTag = 0x4C4F4354; // 'LOCT'
+constexpr uint32_t kSrotTag = 0x53524F54; // 'SROT'
 
 // Real, live-extracted per-context-byte lookup table (x32dbg static-memory
 // dump of swgemu.exe:01945BB8, 2026-07-22 morning session). Each real
@@ -417,6 +418,22 @@ Quaternion decodeSmallestThreeQuaternion(uint32_t u32, bool skipZNegation, int f
     return q;
 }
 
+// Shared by parseQchn (animated keyframes) and the SROT static-rotation
+// decode below - both real "smallest three" quantized payloads need the
+// exact same per-bone-group skip/forced-idx decode overrides.
+void computeZNegationAndForcedIdx(const std::string& boneName, bool& skipZNegation, int& forcedIdxOverride) {
+    skipZNegation = (g_experimentSkipZNegationForArms && isArmChainBone(boneName)) ||
+                     (g_experimentSkipZNegationForRoot && isRootBone(boneName)) ||
+                     (g_experimentSkipZNegationForLegs && isLegChainBone(boneName)) ||
+                     isFingerChainBone(boneName);
+    forcedIdxOverride = -1;
+    if (g_legForcedDropIndex >= 0 && isLegChainBone(boneName)) {
+        forcedIdxOverride = g_legForcedDropIndex;
+    } else if (g_fingerForcedDropIndex >= 0 && isFingerChainBone(boneName)) {
+        forcedIdxOverride = g_fingerForcedDropIndex;
+    }
+}
+
 // A real CHNK QCHN: leading uint16 keyframe count, then a real 3-byte
 // per-channel value - confirmed live (x32dbg, 2026-07-22 morning session)
 // to be 3 SEPARATE bytes, one per retained rotation component, each a
@@ -447,25 +464,19 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
     }
 
     // Real fix, live-verified 2026-07-25 (post quaternion-byte-order-fix
-    // retest of the finger 'H' axis-fix debug key, previously tested with a
-    // negative result under the OLD, byte-order-broken skeleton parser -
-    // that old result no longer applies): the wrist/finger chain (this
-    // project's own isFingerChainBone list, already widened to include
-    // forearm/ulna/wrist) needs Z-negation SKIPPED, unlike every other bone
-    // - direct live A/B against a live private test server confirmed
-    // fingers curl the correct direction (into the palm, not away from it)
-    // only once this is applied. Now the permanent default rather than a
-    // manual debug-key toggle.
-    bool skipZNegation = (g_experimentSkipZNegationForArms && isArmChainBone(boneNameForDebug)) ||
-                          (g_experimentSkipZNegationForRoot && isRootBone(boneNameForDebug)) ||
-                          (g_experimentSkipZNegationForLegs && isLegChainBone(boneNameForDebug)) ||
-                          isFingerChainBone(boneNameForDebug);
-    int forcedIdxOverride = -1;
-    if (g_legForcedDropIndex >= 0 && isLegChainBone(boneNameForDebug)) {
-        forcedIdxOverride = g_legForcedDropIndex;
-    } else if (g_fingerForcedDropIndex >= 0 && isFingerChainBone(boneNameForDebug)) {
-        forcedIdxOverride = g_fingerForcedDropIndex;
-    }
+    // retest of the Phase 21 finger 'H' axis-fix debug key, previously
+    // tested with a negative result under the OLD, byte-order-broken
+    // skeleton parser - see project_animation_phase21_inprogress.md's "v3"
+    // section, that old result no longer applies): the wrist/finger chain
+    // (this project's own isFingerChainBone list, already widened to
+    // include forearm/ulna/wrist) needs Z-negation SKIPPED, unlike every
+    // other bone - direct live A/B against Naritus confirmed fingers curl
+    // the correct direction (into the palm, not away from it) only once
+    // this is applied. Now the permanent default rather than a manual
+    // debug-key toggle.
+    bool skipZNegation;
+    int forcedIdxOverride;
+    computeZNegationAndForcedIdx(boneNameForDebug, skipZNegation, forcedIdxOverride);
     std::vector<QuaternionKeyframe> result(count);
     for (size_t i = 0; i < count; ++i) {
         result[i].frame = buf.readUint16();
@@ -480,6 +491,39 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
     if (isFingerChainBone(boneNameForDebug) && !result.empty()) {
         std::printf("[ANIMDBG] QCHN bone=%s count=%zu lastFrame=%u\n", boneNameForDebug.c_str(), count,
                     result.back().frame);
+    }
+    return result;
+}
+
+// One real CHNK SROT entry: 3 context bytes (same per-component
+// base/level selectors as a QCHN channel's own 3-byte header) followed by
+// one real uint32 quantized rotation payload - the SAME "smallest three"
+// encoding as a single QCHN keyframe, just one constant value instead of a
+// curve. Confirmed against the leaked original
+// CompressedKeyframeAnimationTemplate::load_0001 source (the real
+// `TAG_SROT` read loop): `xFormat, yFormat, zFormat, compressedRotationValue`
+// per entry, no leading count (the real client instead trusts a
+// `staticRotationCount` read earlier from CHNK INFO, which this project's
+// own parser doesn't separately track) - reading until the chunk's own
+// data is exhausted is equivalent since every entry is a fixed 7 bytes.
+struct RawSrotEntry {
+    uint8_t xFormat;
+    uint8_t yFormat;
+    uint8_t zFormat;
+    uint32_t compressedRotationValue;
+};
+
+std::vector<RawSrotEntry> parseSrotRaw(const IffChunk& chunk) {
+    soe::PacketBuffer buf = chunk.data;
+    buf.resetReadCursor();
+    std::vector<RawSrotEntry> result;
+    while (buf.remaining() >= 7) {
+        RawSrotEntry entry;
+        entry.xFormat = buf.readByte();
+        entry.yFormat = buf.readByte();
+        entry.zFormat = buf.readByte();
+        entry.compressedRotationValue = buf.readUint32();
+        result.push_back(entry);
     }
     return result;
 }
@@ -545,6 +589,7 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
     }
     const IffChunk* atrnForm = findFirstForm(clipForm, kAtrnTag); // optional - not every real clip animates a translated bone
     const IffChunk* loctChunk = findFirstChunk(clipForm, kLoctTag); // optional - only real locomotion clips (walk/run) have one
+    const IffChunk* srotChunk = findFirstChunk(clipForm, kSrotTag); // optional - not every real clip has any non-animated bones
 
     std::vector<const IffChunk*> qchnChunks;
     for (const IffChunk& child : arotForm->children) {
@@ -560,6 +605,10 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
             }
         }
     }
+    std::vector<RawSrotEntry> srotEntries;
+    if (srotChunk != nullptr) {
+        srotEntries = parseSrotRaw(*srotChunk);
+    }
 
     AnimationClipData result;
     for (const IffChunk& xfinChunk : xfrmForm->children) {
@@ -574,8 +623,12 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
 
         // Real per-bone record (10 bytes, confirmed fixed-size across every
         // real XFIN checked this session, regardless of bone name length):
-        // [byte hasRotation][uint16 rotationChannelIndex or a real, separate
-        // hardpoint-bone counter when hasRotation==0, not used]
+        // [byte hasRotation][uint16 rotationChannelIndex - index into
+        // AROT's QCHN channels when hasRotation!=0, or index into CHNK
+        // SROT's static-rotation array when hasRotation==0 - confirmed
+        // 2026-07-28 against the leaked original
+        // TransformInfo::m_rotationChannelIndex/getStaticRotation source;
+        // previously (wrongly) assumed unused in the hasRotation==0 case]
         // [byte hasTranslation][uint16 x3 - real ATRN channel indices when
         // hasTranslation != 0 (confirmed only for `root` this session); a
         // real, separate per-bone counter (likely indexing STRN's unread
@@ -602,6 +655,20 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
         }
         if (hasRotation != 0 && rotationChannelIndex < qchnChunks.size()) {
             bone.rotationKeyframes = parseQchn(*qchnChunks[rotationChannelIndex], bone.boneName);
+        } else if (hasRotation == 0 && rotationChannelIndex < srotEntries.size()) {
+            // Real per-clip STATIC rotation - see AnimationBoneChannel's
+            // own `hasStaticRotation` comment. NOT identity/no-delta in
+            // general; a genuine, real, per-bone rest offset authored for
+            // this specific clip, decoded with the exact same "smallest
+            // three" math already confirmed correct for QCHN keyframes.
+            const RawSrotEntry& entry = srotEntries[rotationChannelIndex];
+            bool skipZNegation;
+            int forcedIdxOverride;
+            computeZNegationAndForcedIdx(bone.boneName, skipZNegation, forcedIdxOverride);
+            bone.staticRotation = decodeSmallestThreeQuaternion(
+                entry.compressedRotationValue, skipZNegation, forcedIdxOverride, entry.xFormat, entry.yFormat,
+                entry.zFormat);
+            bone.hasStaticRotation = true;
         }
         // Real bug found live (Phase 21): `hasTranslation` isn't a plain
         // boolean - it's a real per-axis bitmask (bit 3 = X, bit 4 = Y,

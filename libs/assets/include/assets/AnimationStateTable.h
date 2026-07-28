@@ -127,14 +127,16 @@ struct AnimationStateTableData {
 // one of "male"/"female" - looked up directly in a real "gender" Switch's
 // own `switchValueMap` (the real mechanism - see AnimationNode's own
 // comment), falling back to `switchDefaultIndex` if the value isn't
-// present. There is deliberately no "mood"/trigger context yet: this
-// project does not track real server-driven mood/emote state, so any
-// `Switch` whose `parameterName` isn't "gender" (confirmed real: "mood",
-// but treated generically - ANY unrecognized switch name gets the same
-// treatment) always falls through to `switchDefaultIndex` instead of
-// modeling the real trigger-matching system.
+// present. `mood` is the real server-driven mood value (from
+// `CreatureObjectBaseline6::moodString`, see libs/creatureanim) - looked up
+// the identical way against a real "mood" Switch. Any `Switch` whose
+// `parameterName` is neither "gender" nor "mood" (there is no known third
+// real named switch as of this writing) always falls through to
+// `switchDefaultIndex` instead of modeling the real trigger-matching
+// system, same as an empty/unset `mood` does.
 struct AnimationSelectionContext {
     std::string gender;
+    std::string mood;
 };
 
 class AnimationStateTable {

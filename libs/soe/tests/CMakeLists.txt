@@ -53,6 +53,8 @@ add_executable(soe_tests
     test_schema_engine.cpp
     test_worldmodel_objectstore.cpp
     test_worldmodel_singletonregistry.cpp
+    test_creatureanim_statebitmask.cpp
+    test_creatureanim_stateselection.cpp
     test_assets_iffreader.cpp
     test_assets_trearchive.cpp
     test_assets_sharedobjecttemplate.cpp
@@ -64,11 +66,12 @@ add_executable(soe_tests
     test_assets_skeletalmesh.cpp
     test_assets_skeletalappearance.cpp
     test_assets_animationstatetable.cpp
+    test_assets_animationclip.cpp
     test_assets_buildinglayout.cpp
     test_assets_shadertemplate.cpp
     test_assets_ddsimage.cpp
 )
 
-target_link_libraries(soe_tests PRIVATE soe::soe swgproto::swgproto worldmodel::worldmodel assets::assets terrain::terrain doctest::doctest)
+target_link_libraries(soe_tests PRIVATE soe::soe swgproto::swgproto worldmodel::worldmodel assets::assets terrain::terrain creatureanim::creatureanim doctest::doctest)
 
 add_test(NAME soe_tests COMMAND soe_tests)
