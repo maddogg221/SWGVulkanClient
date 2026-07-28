@@ -19,7 +19,7 @@ namespace dummyclient {
 // directly through the same AnimationDebugControls/ScreenshotCapture state
 // the 'K'/'U'/'V'/'P' keys already drive, no OS input injection involved.
 //
-// Three mutually-exclusive modes (only one CLI flag is ever passed at a
+// Four mutually-exclusive modes (only one CLI flag is ever passed at a
 // time), all captured to a locked camera angle:
 //   - formulaSecondsPerPhase > 0: A/B tests the old two-term vs. real
 //     three-term bind-pose formula (see AnimationDebugControls::
@@ -32,17 +32,25 @@ namespace dummyclient {
 //     bindRotationAxisFixVariant values (see AnimationDebugControls::
 //     bindRotationAxisFixVariant), capturing to diagnostic_screenshots/
 //     restpose_bindaxis_<N>/.
+//   - bindPoseOnlySecondsPerPhase > 0: the "isolate back to no animation"
+//     test - forces AnimationDebugControls::forceBindPoseOnly (clip=
+//     nullptr, so animRot stays identity for every bone - the pure
+//     computed `.skt` bind pose, zero clip involvement at all) combined
+//     with the confirmed-correct useRealBindPoseFormula, cycling all 4
+//     locked camera angles (0/90/180/270deg, matching the front/back/side
+//     reference screenshots) instead of just one, capturing to
+//     diagnostic_screenshots/restpose_bindonly_<N*90>deg/.
 class RestPoseAutoTest {
 public:
     RestPoseAutoTest(int formulaSecondsPerPhase, int variantSweepSecondsPerPhase,
-                      int bindAxisSweepSecondsPerPhase = 0);
+                      int bindAxisSweepSecondsPerPhase = 0, int bindPoseOnlySecondsPerPhase = 0);
 
     // False (the common case) means neither CLI flag was passed - drive()
     // should never be called, and complete() will always be false, so the
     // caller's own `!complete()` loop condition never forces an exit.
     bool enabled() const {
         return formulaSecondsPerPhase_ > 0 || variantSweepSecondsPerPhase_ > 0 ||
-               bindAxisSweepSecondsPerPhase_ > 0;
+               bindAxisSweepSecondsPerPhase_ > 0 || bindPoseOnlySecondsPerPhase_ > 0;
     }
 
     // Once true, the requested auto-test has finished every phase - the
@@ -59,6 +67,7 @@ private:
     int formulaSecondsPerPhase_;
     int variantSweepSecondsPerPhase_;
     int bindAxisSweepSecondsPerPhase_;
+    int bindPoseOnlySecondsPerPhase_;
     std::chrono::steady_clock::time_point startTime_;
     bool complete_ = false;
     int lastPhaseLogged_ = -1;

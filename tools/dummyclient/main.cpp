@@ -971,6 +971,11 @@ struct CliOptions {
     // Same idea again, sweeping bindRotationAxisFixVariant (0-6) - see
     // runVisualizer's own comment on autoRestPoseBindAxisSweepSecondsPerPhase.
     int autoRestPoseBindAxisSweepSecondsPerPhase = 0;
+    // The "isolate this back to no animation and retest" test - forces
+    // forceBindPoseOnly (pure computed `.skt` bind pose, zero clip
+    // involvement) across all 4 locked camera angles - see runVisualizer's
+    // own comment on autoRestPoseBindOnlySecondsPerPhase.
+    int autoRestPoseBindOnlySecondsPerPhase = 0;
 
     // Real SWG client install directory - used by the visualizer's
     // RealMeshResolver to open real .tre archives and render actual
@@ -1046,6 +1051,8 @@ CliOptions parseCommandLine(int argc, char** argv) {
             opts.autoRestPoseVariantSweepSecondsPerPhase = std::stoi(next("--rest-pose-variant-sweep"));
         else if (arg == "--rest-pose-bindaxis-sweep")
             opts.autoRestPoseBindAxisSweepSecondsPerPhase = std::stoi(next("--rest-pose-bindaxis-sweep"));
+        else if (arg == "--rest-pose-bindonly-test")
+            opts.autoRestPoseBindOnlySecondsPerPhase = std::stoi(next("--rest-pose-bindonly-test"));
         else if (arg == "--client-path") opts.clientPath = next("--client-path");
         else if (arg == "--dump-pob") opts.dumpPobPath = next("--dump-pob");
         else if (arg == "--list-files") opts.listFilesSubstring = next("--list-files");
@@ -1901,7 +1908,8 @@ int main(int argc, char** argv) {
                            objectStore, opts.clientPath, terrainName,
                            opts.autoRestPoseTestSecondsPerPhase,
                            opts.autoRestPoseVariantSweepSecondsPerPhase,
-                           opts.autoRestPoseBindAxisSweepSecondsPerPhase);
+                           opts.autoRestPoseBindAxisSweepSecondsPerPhase,
+                           opts.autoRestPoseBindOnlySecondsPerPhase);
 #endif
         } else {
             observeMovement(zoneSession, zoneDispatcher, zoneFailed, objControllerDispatcher,

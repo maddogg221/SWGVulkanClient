@@ -59,11 +59,19 @@ class ObjectStore;
 // before since legs (the only bones independently cross-validated so far)
 // have exactly-identity values there, which would hide such a bug entirely.
 // Captures into diagnostic_screenshots/restpose_bindaxis_<N>/.
+// `autoRestPoseBindOnlySecondsPerPhase` (0 = disabled): "isolate this back
+// to no animation and retest" - forces `forceBindPoseOnly` (clip=nullptr,
+// so animRot stays identity for EVERY bone, not just ones a clip doesn't
+// cover - the pure computed `.skt` bind pose) combined with the
+// confirmed-correct `useRealBindPoseFormula`, cycling all 4 locked camera
+// angles (matching the front/back/side reference screenshots) instead of
+// just one. Captures into diagnostic_screenshots/restpose_bindonly_<N*90>deg/.
 void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatcher, bool& failed,
                     swgproto::ObjControllerDispatcher& objControllerDispatcher,
                     const worldmodel::ObjectStore& objectStore, const std::string& clientPath,
                     const std::string& terrainName, int autoRestPoseTestSecondsPerPhase = 0,
                     int autoRestPoseVariantSweepSecondsPerPhase = 0,
-                    int autoRestPoseBindAxisSweepSecondsPerPhase = 0);
+                    int autoRestPoseBindAxisSweepSecondsPerPhase = 0,
+                    int autoRestPoseBindOnlySecondsPerPhase = 0);
 
 #endif

@@ -2351,7 +2351,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     const worldmodel::ObjectStore& objectStore, const std::string& clientPath,
                     const std::string& terrainName, int autoRestPoseTestSecondsPerPhase,
                     int autoRestPoseVariantSweepSecondsPerPhase,
-                    int autoRestPoseBindAxisSweepSecondsPerPhase) {
+                    int autoRestPoseBindAxisSweepSecondsPerPhase,
+                    int autoRestPoseBindOnlySecondsPerPhase) {
     // kObjControllerMessageHash forwarding is no longer registered locally
     // here - main() now owns it permanently (see its 2026-07-18 fix comment).
     renderer::Window window(1920, 1080, L"SWG Client - Crude Visualizer");
@@ -2443,7 +2444,8 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     dummyclient::ScreenshotCapture screenshotCapture;
     dummyclient::RestPoseAutoTest autoTest(autoRestPoseTestSecondsPerPhase,
                                             autoRestPoseVariantSweepSecondsPerPhase,
-                                            autoRestPoseBindAxisSweepSecondsPerPhase);
+                                            autoRestPoseBindAxisSweepSecondsPerPhase,
+                                            autoRestPoseBindOnlySecondsPerPhase);
 
     // Player movement (Phase 13) - a LOCALLY predicted position/facing,
     // driven by WASD input every frame and only ever seeded ONCE from

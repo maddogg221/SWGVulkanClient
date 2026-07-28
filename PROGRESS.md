@@ -200,3 +200,34 @@ worth stating plainly for anyone evaluating the codebase:
   and the internally-visible leads are exhausted — if this describes a
   symptom you recognize from real hands-on experience with this
   platform's animation pipeline, please open an issue.
+- **Follow-up: isolating the pose back to zero animation confirms the
+  base rest configuration itself is correct — narrowing the question to
+  one specific, well-defined remaining possibility.** With every per-clip
+  animation data source exhausted (see above), the next step was to
+  strip animation out of the equation entirely and look at the raw,
+  computed base pose alone — the thing every animation is layered on top
+  of. Doing that and comparing it from every angle confirmed it's a
+  genuine, textbook T-pose: arms held fully horizontal. That's actually a
+  clarifying result, not a new problem — a T-pose base reference is the
+  standard convention for a skinned character rig, used essentially
+  universally, so this project's own base pose is very likely correct as
+  it stands. The real client never shows literal base pose either; a
+  character is always animated. Which means the entire job of turning
+  that T-pose into a natural at-the-sides stance has to come from
+  animation data layered on top of it — and every real source of that
+  data available to this project, exhaustively checked, tops out around
+  a third of what's actually needed. That points the remaining
+  investigation at one specific, well-defined question instead of an
+  open-ended one: either this project is resolving to the wrong specific
+  clip for this situation, or the real client applies some additional,
+  always-on base layer before the visible idle motion that hasn't been
+  identified yet. Settling that needs a form of investigation this
+  project has used before but not yet applied here — directly observing
+  the real client's own behavior at the machine-code level, a
+  higher-cost, higher-risk step than anything used to reach this point.
+  Given how much has already gone into isolating this, this is a
+  deliberate, natural point to also step back and let this stand as a
+  clearly documented open question while the project's attention moves
+  toward other, higher-priority systems (crafting, combat) for now —
+  revisited if new information (either from further investigation or
+  from someone recognizing this symptom) makes the next step clearer.

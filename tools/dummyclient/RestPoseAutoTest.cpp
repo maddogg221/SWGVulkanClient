@@ -7,14 +7,41 @@
 namespace dummyclient {
 
 RestPoseAutoTest::RestPoseAutoTest(int formulaSecondsPerPhase, int variantSweepSecondsPerPhase,
-                                    int bindAxisSweepSecondsPerPhase)
+                                    int bindAxisSweepSecondsPerPhase, int bindPoseOnlySecondsPerPhase)
     : formulaSecondsPerPhase_(formulaSecondsPerPhase),
       variantSweepSecondsPerPhase_(variantSweepSecondsPerPhase),
       bindAxisSweepSecondsPerPhase_(bindAxisSweepSecondsPerPhase),
+      bindPoseOnlySecondsPerPhase_(bindPoseOnlySecondsPerPhase),
       startTime_(std::chrono::steady_clock::now()) {}
 
 void RestPoseAutoTest::driveFrame(AnimationDebugControls& controls, ScreenshotCapture& capture) {
     float elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime_).count();
+
+    if (bindPoseOnlySecondsPerPhase_ > 0) {
+        float phaseSeconds = static_cast<float>(bindPoseOnlySecondsPerPhase_);
+        int phase = static_cast<int>(elapsed / phaseSeconds);
+        if (phase == lastPhaseLogged_) {
+            return;
+        }
+        lastPhaseLogged_ = phase;
+        if (phase >= 4) {
+            capture.burstCaptureActive = false;
+            complete_ = true;
+            std::cout << "[VISUALIZER] auto rest-pose bind-only test complete, exiting\n";
+            return;
+        }
+        controls.forceBindPoseOnly = true;
+        controls.useRealBindPoseFormula = true;
+        capture.burstCaptureFolderOverride = "restpose_bindonly_" + std::to_string(phase * 90) + "deg";
+        capture.burstCaptureActive = true;
+        capture.lockedCameraMode = true;
+        capture.lockedCameraAngleIndex = phase;
+        std::cout << "[VISUALIZER] auto rest-pose bind-only test phase " << phase << " (angle="
+                   << (phase * 90) << "deg, forceBindPoseOnly=true, useRealBindPoseFormula=true)"
+                   << " - capturing to diagnostic_screenshots/" << capture.burstCaptureFolderOverride
+                   << "/\n";
+        return;
+    }
 
     if (bindAxisSweepSecondsPerPhase_ > 0) {
         float phaseSeconds = static_cast<float>(bindAxisSweepSecondsPerPhase_);
