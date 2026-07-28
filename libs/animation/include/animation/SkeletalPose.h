@@ -117,9 +117,8 @@ std::vector<int> bindClipBoneIndices(const assets::SkeletonData& skeleton,
 // after finding a real, previously-unread `.skt` chunk (`BPRO` -
 // `bindPoseRotation`, one quaternion per bone) by reading the real original
 // client source (a 2015 leak of Sony Online Entertainment's own code,
-// confirmed genuine via literal copyright headers - see project memory
-// project_animation_phase21_inprogress.md's "v3" section for the full
-// account). The real client composes a bone's local rotation as
+// confirmed genuine via literal copyright headers). The real client
+// composes a bone's local rotation as
 // `postRotation * (animatedRotation * preRotation)` where `animatedRotation
 // = animationResolverRotation * bindPoseRotation` (animationResolverRotation
 // = identity for bind pose, or the clip's own decoded rotation when

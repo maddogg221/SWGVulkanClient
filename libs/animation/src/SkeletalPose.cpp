@@ -230,10 +230,9 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                 // AnimationBoneChannel::hasStaticRotation's own comment).
                 // Applying it here means bones like lWrist/lUlna (confirmed
                 // to have no animated rotation channel in the idle-breathe
-                // clip - see project_animation_phase21_inprogress.md's
-                // "Fourth session" section) get their real authored rest
-                // offset instead of silently staying at raw `.skt` bind
-                // pose for the bone's own local rotation.
+                // clip) get their real authored rest offset instead of
+                // silently staying at raw `.skt` bind pose for the bone's
+                // own local rotation.
                 animRot = XMVectorSet(channel.staticRotation.x, channel.staticRotation.y,
                                        channel.staticRotation.z, channel.staticRotation.w);
                 hasAnimRot = true;
@@ -575,8 +574,7 @@ void skinSubmeshVertices(const SkeletalMeshSubmesh& submesh,
     // ONCE across all body parts together (not independently per
     // `skinSubmeshVertices` call) - and must be validated across
     // multiple body parts together, not one mesh file at a time, before
-    // ever going live again. See [[project_animation_phase21_inprogress]]
-    // for the full account of both attempts.
+    // ever going live again.
 
     // Real bug found live (Phase 21): real facial-feature mesh bones
     // (jaw/eyes/lids/brows/lips - see isFacialFeatureBone above) have no

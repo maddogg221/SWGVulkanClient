@@ -466,8 +466,7 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
     // Real fix, live-verified 2026-07-25 (post quaternion-byte-order-fix
     // retest of the Phase 21 finger 'H' axis-fix debug key, previously
     // tested with a negative result under the OLD, byte-order-broken
-    // skeleton parser - see project_animation_phase21_inprogress.md's "v3"
-    // section, that old result no longer applies): the wrist/finger chain
+    // skeleton parser - that old result no longer applies): the wrist/finger chain
     // (this project's own isFingerChainBone list, already widened to
     // include forearm/ulna/wrist) needs Z-negation SKIPPED, unlike every
     // other bone - direct live A/B against Naritus confirmed fingers curl
