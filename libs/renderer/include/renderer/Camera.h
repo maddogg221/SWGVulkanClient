@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include <DirectXMath.h>
 
 namespace renderer {
@@ -62,6 +64,37 @@ struct FollowCamera {
     DirectX::XMFLOAT3 lookDirection() const;
 
     DirectX::XMMATRIX viewMatrix(const DirectX::XMFLOAT3& targetPosition) const;
+};
+
+// A view frustum, extracted from a combined view*projection matrix via
+// Gribb/Hartmann plane extraction - adapted specifically for DirectXMath's
+// row-vector convention (clip = v * M, v a row vector, so each clip
+// component is a dot product with a COLUMN of M, and each plane is
+// therefore a linear combination of the matrix's own COLUMNS, not rows)
+// and Direct3D's [0,1] depth range (the near plane is `column2` alone, not
+// `column3+column2` as in the OpenGL [-1,1]-depth version of this
+// algorithm). Used for real portal-based cell
+// visibility culling (see worldmodel::computeVisibleCells()) - this
+// project's first frustum/culling infrastructure. Original code, not a
+// port: no real client/server source describes this (it's generic camera
+// math, not a real file format or protocol detail this project holds to
+// its usual "verify against real bytes" bar).
+struct Frustum {
+    // Left, right, bottom, top, near, far, in that order - each plane is
+    // (a, b, c, d) for ax+by+cz+d=0, normalized, with an INWARD-facing
+    // normal (a point is on the inside of a plane when
+    // a*x + b*y + c*z + d >= 0).
+    std::array<DirectX::XMFLOAT4, 6> planes;
+
+    static Frustum fromViewProjection(DirectX::XMMATRIX viewProj);
+
+    // True if the sphere is at least partially inside every plane - the
+    // standard conservative sphere-frustum test (may return true for a
+    // sphere that's actually just outside a frustum corner - the two
+    // "outside" regions of adjacent planes overlapping near a corner is a
+    // well-known limitation of per-plane sphere tests - but never false for
+    // one that's actually at least partially visible).
+    bool intersectsSphere(DirectX::XMFLOAT3 center, float radius) const;
 };
 
 } // namespace renderer

@@ -52,6 +52,17 @@ public:
 
     const std::unordered_map<ChunkCoord, ChunkHeightData, ChunkCoordHash>& loadedChunks() const;
 
+    // Evicts every already-loaded chunk whose world-space AABB overlaps a
+    // circle of `radiusMeters` centered at (worldX, worldZ) - fixes a real
+    // cache-staleness gap `loaded_` otherwise has (it only ever evicts by
+    // distance-from-player in recenterAndEvict(), never on content change).
+    // Evicted chunks regenerate correctly, picking up the new terrain
+    // state, on the next update()/loadOneMissingChunk() call - callers
+    // (e.g. building-grading registration) should call this right after
+    // any change to the underlying TerrainSource's queried values at that
+    // location.
+    void invalidateChunksOverlapping(float worldX, float worldZ, float radiusMeters);
+
 private:
     // Recomputes the center chunk from (worldX, worldZ) and evicts any
     // loaded chunk now outside radiusInChunks_ of it - a no-op if the

@@ -48,11 +48,14 @@ add_executable(soe_tests
     test_terrain_queryheight.cpp
     test_terrain_querycolor.cpp
     test_terrain_chunkmesh.cpp
+    test_terrain_grading.cpp
     test_objcontrollerdispatcher.cpp
     test_objectstatedispatcher.cpp
     test_schema_engine.cpp
     test_worldmodel_objectstore.cpp
     test_worldmodel_singletonregistry.cpp
+    test_worldmodel_portalvisibility.cpp
+    test_renderer_frustum.cpp
     test_creatureanim_statebitmask.cpp
     test_creatureanim_stateselection.cpp
     test_assets_iffreader.cpp
@@ -72,6 +75,6 @@ add_executable(soe_tests
     test_assets_ddsimage.cpp
 )
 
-target_link_libraries(soe_tests PRIVATE soe::soe swgproto::swgproto worldmodel::worldmodel assets::assets terrain::terrain creatureanim::creatureanim doctest::doctest)
+target_link_libraries(soe_tests PRIVATE soe::soe swgproto::swgproto worldmodel::worldmodel assets::assets terrain::terrain creatureanim::creatureanim renderer::renderer doctest::doctest)
 
 add_test(NAME soe_tests COMMAND soe_tests)

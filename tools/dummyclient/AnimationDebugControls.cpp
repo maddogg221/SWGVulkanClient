@@ -144,7 +144,7 @@ void AnimationDebugControls::processFrameInput(
 
     bool bindRotationAxisFixKeyDown = renderer::Window::isKeyDown('Y');
     if (bindRotationAxisFixKeyDown && !bindRotationAxisFixKeyWasDown_) {
-        bindRotationAxisFixVariant = (bindRotationAxisFixVariant + 1) % 7;
+        bindRotationAxisFixVariant = (bindRotationAxisFixVariant + 1) % 8;
         std::cout << "[VISUALIZER] self bind-rotation-axis-fix-variant = " << bindRotationAxisFixVariant
                    << "\n";
     }

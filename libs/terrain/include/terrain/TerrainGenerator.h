@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -15,9 +16,7 @@ namespace terrain {
 
 // The fully-parsed `FORM TGEN` tree: every family group plus the top-level
 // Layer list, plus queryHeight()/queryColor()/queryShaderId() - the real
-// Boundary/Filter/Affector tree-walk algorithm (recovered from
-// TerrainGenerator::Layer::affect() in SWG-Source-ref's git history, same
-// commit as everything else in this library) adapted from the real
+// Boundary/Filter/Affector tree-walk algorithm, adapted from the real
 // engine's chunk-grid generation into a single-point query, since this
 // project has no chunk-grid infrastructure to generate into. All three
 // query methods share one internal per-point walk (height/color/shader
@@ -58,6 +57,18 @@ struct TerrainGenerator {
     // malformed/unrecognized content within it.
     static TerrainGenerator parse(const assets::IffChunk& tgenForm,
                                    const assets::TreArchive* textureArchive = nullptr);
+
+    // Parses a real standalone `.lay` terrain-modification file (e.g.
+    // `terrain/ply_tatt_house_sml_s01.lay`) - the same real per-building
+    // grading data the real client/server loads via
+    // ProceduralTerrainAppearance::addTerrainModification(). Unlike a real
+    // `.trn`, a `.lay` file's raw IFF bytes have no enclosing
+    // `FORM TGEN -> FORM 0000` wrapper and no `FORM LYRS` around its layer
+    // tree (confirmed via a real-bytes walk) - this synthesizes that
+    // wrapper in memory and delegates to parse() unchanged. Throws
+    // std::runtime_error under the same conditions parse() does.
+    static TerrainGenerator parseStandalone(const std::vector<uint8_t>& layBytes,
+                                             const assets::TreArchive* textureArchive = nullptr);
 
     // Returns nullptr if familyId doesn't reference any parsed FractalGroup
     // family - callers treat this as "can't happen for a well-formed real
@@ -137,6 +148,18 @@ struct TerrainGenerator {
         int shaderFamilyId = -1;
     };
     Point queryPoint(float worldX, float worldZ) const;
+
+    // Same as queryPoint(worldX, worldZ) but starts the layer-tree walk from
+    // `startingPoint` instead of a default-constructed Point - lets a caller
+    // (ProceduralTerrainSource, chaining the main planet generator with
+    // per-building terrain-modification generators) thread one running
+    // value through multiple TerrainGenerator instances sequentially,
+    // matching the real engine's own chaining semantics
+    // (ProceduralTerrainAppearance::getHeight() threads one `fullTraverse`
+    // value through the main generator then every registered modification
+    // in insertion order - a TGO_replace affector lerps against whatever
+    // the chain already produced, not a generator-local default).
+    Point queryPoint(float worldX, float worldZ, Point startingPoint) const;
 };
 
 } // namespace terrain

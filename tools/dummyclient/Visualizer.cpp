@@ -62,10 +62,13 @@
 #include "swgproto/DataTransformWithParent.h"
 #include "swgproto/ObjControllerDispatcher.h"
 #include "swgproto/ObjectMenuSelect.h"
+#include "terrain/Layer.h"
 #include "terrain/ProceduralTerrainSource.h"
 #include "terrain/TerrainChunkManager.h"
+#include "terrain/TerrainGenerator.h"
 #include "terrain/TerrainMesh.h"
 #include "worldmodel/ObjectStore.h"
+#include "worldmodel/PortalVisibility.h"
 
 namespace {
 
@@ -535,6 +538,21 @@ DirectX::XMFLOAT3 worldToBuildingLocal(const DirectX::XMFLOAT3& worldPos,
                               dx * sinYaw + dz * cosYaw};
 }
 
+// The exact inverse of worldToBuildingLocal() above - rotating a
+// building-local offset back by -buildingYaw (a rotation matrix's inverse
+// is its transpose) then re-adding the building's own world position.
+// Real portal-visibility use (Phase 22): real `.pob` portal vertices are
+// building-local, but the frustum visibility test needs world space.
+DirectX::XMFLOAT3 buildingLocalToWorld(const DirectX::XMFLOAT3& localPos,
+                                        const worldmodel::WorldObject& building) {
+    float buildingYaw = (static_cast<float>(building.direction) / 100.0f) * DirectX::XM_2PI;
+    float cosYaw = std::cos(buildingYaw);
+    float sinYaw = std::sin(buildingYaw);
+    float dx = localPos.x * cosYaw + localPos.z * sinYaw;
+    float dz = -localPos.x * sinYaw + localPos.z * cosYaw;
+    return DirectX::XMFLOAT3{building.x + dx, building.y + localPos.y, building.z + dz};
+}
+
 // Resolves a real objectCrc (from SceneCreateObjectByCrc, now stored on
 // WorldObject - see its own comment) to real uploaded mesh geometry,
 // walking the chain this session discovered and verified against real
@@ -806,6 +824,41 @@ public:
             }
         }
         std::cout << "[BUILDING] loaded " << crcToTemplatePath_.size() << " candidate template paths\n";
+
+        // Real terrain-grading map (Phase 22) - ground truth, not a
+        // heuristic: extracted directly from every real, non-empty
+        // `terrainModificationFileName` across Core3's own
+        // `bin/scripts/object/building/**/objects.lua` (496 real
+        // template->`.lay` pairs, only 7 distinct real `.lay` files -
+        // confirmed live-caught bug session, 2026-07-28: an EARLIER
+        // heuristic guess (matching by planet/size-token substring against
+        // generic candidate filenames) applied grading to a player
+        // guildhall, but Core3's own real source confirms every single
+        // player house/guildhall template - every size, every planet, no
+        // exceptions - has `terrainModificationFileName = ""`, and
+        // `GroundZoneContainerComponent.cpp`'s own real gate
+        // (`if (!modFile.isEmpty()) addTerrainModification(...)`) means the
+        // real live game applies ZERO terrain grading to player
+        // construction, period. Real grading is reserved for military
+        // installations, starports, faction-perk HQs, and creature lairs -
+        // never player housing. A template not present in this map (which
+        // includes every real player house/guildhall) gets no grading at
+        // all now, matching real behavior exactly instead of guessing.
+        std::ifstream gradingMapFile(std::string(SWG_ASSETS_DATA_DIR) + "/real_terrain_grading_map.txt");
+        if (gradingMapFile.is_open()) {
+            std::string line;
+            while (std::getline(gradingMapFile, line)) {
+                if (line.empty()) {
+                    continue;
+                }
+                size_t tab = line.find('\t');
+                if (tab == std::string::npos) {
+                    continue;
+                }
+                realGradingMap_[line.substr(0, tab)] = line.substr(tab + 1);
+            }
+        }
+        std::cout << "[BUILDING] loaded " << realGradingMap_.size() << " real terrain-grading entries\n";
     }
 
     // Pure-CPU resolution, same threading contract as every other resolver
@@ -916,6 +969,32 @@ public:
             // fine; `cell` is a const& into `layout.cells` so it can't be
             // moved from here.
             resolvedCell.collisionMesh = cell.collisionMesh;
+            // TEMPORARY diagnostic (2026-07-28, ramp collision-gap
+            // investigation) - real vertex extents of this cell's own CMSH
+            // collision mesh, to check whether it actually covers the real
+            // entrance ramp at all (self measured reaching local z~44,
+            // vs. the VISUAL submesh bounds only reaching z~32.5) or
+            // whether this is a genuine content gap - the collision mesh
+            // never having ramp geometry at all, which no margin value
+            // could ever work around. Strip once resolved.
+            if (!resolvedCell.collisionMesh.positions.empty()) {
+                assets::Float3 cmin = resolvedCell.collisionMesh.positions[0];
+                assets::Float3 cmax = resolvedCell.collisionMesh.positions[0];
+                for (const auto& p : resolvedCell.collisionMesh.positions) {
+                    cmin.x = std::min(cmin.x, p.x);
+                    cmin.y = std::min(cmin.y, p.y);
+                    cmin.z = std::min(cmin.z, p.z);
+                    cmax.x = std::max(cmax.x, p.x);
+                    cmax.y = std::max(cmax.y, p.y);
+                    cmax.z = std::max(cmax.z, p.z);
+                }
+                std::cout << "[COLLISION DIAG] cell \"" << cell.name << "\" CMSH real extents min=("
+                           << cmin.x << "," << cmin.y << "," << cmin.z << ") max=(" << cmax.x << ","
+                           << cmax.y << "," << cmax.z << ") vertCount="
+                           << resolvedCell.collisionMesh.positions.size() << "\n";
+            } else {
+                std::cout << "[COLLISION DIAG] cell \"" << cell.name << "\" CMSH is EMPTY\n";
+            }
             // Real portal data (Phase 20b) - same reasoning as
             // collisionMesh above (`cell`/`layout` are both const& here).
             resolvedCell.portals = cell.portals;
@@ -939,6 +1018,24 @@ public:
                                    << resolvedCell.floorMesh.positions.size() << " verts, "
                                    << resolvedCell.floorMesh.triangleVertexIndices.size() / 3
                                    << " tris)\n";
+                        // TEMPORARY diagnostic - see the matching CMSH one
+                        // above.
+                        if (!resolvedCell.floorMesh.positions.empty()) {
+                            assets::Float3 fmin = resolvedCell.floorMesh.positions[0];
+                            assets::Float3 fmax = resolvedCell.floorMesh.positions[0];
+                            for (const auto& p : resolvedCell.floorMesh.positions) {
+                                fmin.x = std::min(fmin.x, p.x);
+                                fmin.y = std::min(fmin.y, p.y);
+                                fmin.z = std::min(fmin.z, p.z);
+                                fmax.x = std::max(fmax.x, p.x);
+                                fmax.y = std::max(fmax.y, p.y);
+                                fmax.z = std::max(fmax.z, p.z);
+                            }
+                            std::cout << "[COLLISION DIAG] cell \"" << cell.name
+                                       << "\" FLR real extents min=(" << fmin.x << "," << fmin.y << ","
+                                       << fmin.z << ") max=(" << fmax.x << "," << fmax.y << ","
+                                       << fmax.z << ")\n";
+                        }
                     } catch (const std::exception& e) {
                         std::cerr << "[FLR] cell \"" << cell.name << "\" parse failed: " << e.what()
                                    << "\n";
@@ -967,6 +1064,50 @@ public:
         return result;
     }
 
+    // Resolves the real per-building terrain-grading `.lay` file for a
+    // building's objectCrc via realGradingMap_ - real GROUND TRUTH, not a
+    // heuristic (see realGradingMap_'s own comment for how it was
+    // extracted and why an earlier heuristic-guess version of this
+    // function was wrong: it applied grading to a player guildhall, but
+    // Core3's own real source confirms player construction NEVER gets
+    // graded - only military/starport/faction-perk-HQ/lair templates do).
+    // Returns std::nullopt (grading simply skipped, never a hard failure)
+    // if objectCrc isn't a known building template, the template isn't in
+    // the real grading map (the real, correct outcome for every player
+    // house/guildhall and the vast majority of other templates), or the
+    // mapped `.lay` file is missing/fails to parse.
+    std::optional<terrain::TerrainGenerator> resolveGradingLay(uint32_t objectCrc) {
+        auto candidateIt = crcToTemplatePath_.find(objectCrc);
+        if (candidateIt == crcToTemplatePath_.end()) {
+            return std::nullopt;
+        }
+        // realGradingMap_ is keyed by the real `clientTemplateFileName`
+        // form (with the "shared_" filename prefix, matching Core3's own
+        // Lua source verbatim) - crcToTemplatePath_ stores the RAW
+        // (pre-"shared_") form (see toSharedTemplatePath()'s own comment),
+        // so convert before looking up.
+        std::string sharedTemplatePath = toSharedTemplatePath(candidateIt->second);
+        auto mapIt = realGradingMap_.find(sharedTemplatePath);
+        if (mapIt == realGradingMap_.end()) {
+            return std::nullopt;
+        }
+        const std::string& layFile = mapIt->second;
+
+        auto bytes = tryExtract(layFile);
+        if (!bytes.has_value()) {
+            std::cerr << "[GRADING] real candidate " << layFile << " (for " << sharedTemplatePath
+                       << ") not found in any open archive\n";
+            return std::nullopt;
+        }
+        try {
+            return terrain::TerrainGenerator::parseStandalone(*bytes);
+        } catch (const std::exception& e) {
+            std::cerr << "[GRADING] real candidate " << layFile << " failed to parse: " << e.what()
+                       << "\n";
+            return std::nullopt;
+        }
+    }
+
 private:
     std::optional<std::vector<uint8_t>> tryExtract(const std::string& name) {
         for (const auto* archive : archives_) {
@@ -979,6 +1120,15 @@ private:
 
     std::vector<const assets::TreArchive*> archives_;
     std::unordered_map<uint32_t, std::string> crcToTemplatePath_;
+
+    // Real terrain-grading map (Phase 22) - see resolveGradingLay()'s own
+    // comment. Keyed by the real `clientTemplateFileName` (with "shared_"
+    // prefix), valued by the real `.lay` filename - both extracted
+    // verbatim from Core3's own `bin/scripts/object/building/**/
+    // objects.lua` (496 real non-empty `terrainModificationFileName`
+    // entries found, only 7 distinct real `.lay` files among them - see
+    // libs/assets/data/real_terrain_grading_map.txt).
+    std::unordered_map<std::string, std::string> realGradingMap_;
 };
 
 // Real per-body-part CPU-side data needed for animation (Phase 21) - unlike
@@ -1494,6 +1644,18 @@ public:
         terrain::ChunkCoord coord;
         terrain::TerrainMeshData meshData;
     };
+    // A building instance's real terrain-grading request - see
+    // requestGrading()'s own comment for why this is keyed by objectId, not
+    // objectCrc. No "Ready" queue counterpart: grading has no GPU upload
+    // step, it's a pure background side effect directly into the shared
+    // ProceduralTerrainSource, so nothing needs to report back to the
+    // render thread.
+    struct GradingRequest {
+        uint64_t objectId;
+        uint32_t objectCrc;
+        float worldX;
+        float worldZ;
+    };
 
     AssetWorkerThread(RealMeshResolver& meshResolver, RealSkeletalMeshResolver& skeletalMeshResolver,
                        RealBuildingResolver& buildingResolver,
@@ -1503,6 +1665,17 @@ public:
         if (terrainSource) {
             terrainChunkManager_ =
                 std::make_unique<terrain::TerrainChunkManager>(terrainSource, radiusInChunks);
+            // Terrain grading (structure footprint flattening, see
+            // requestGrading()) is specific to the procedural terrain
+            // system - not part of the abstract TerrainSource interface,
+            // same as Core3's own ProceduralTerrainAppearance::
+            // addTerrainModification() isn't a generic TerrainManager
+            // concept either. A null result here (a future, different
+            // TerrainSource implementation) just means grading requests
+            // silently no-op - same graceful-degrade posture as everything
+            // else in this class.
+            proceduralTerrainSource_ =
+                std::dynamic_pointer_cast<terrain::ProceduralTerrainSource>(terrainSource);
         }
         thread_ = std::thread([this] { run(); });
     }
@@ -1528,6 +1701,23 @@ public:
     // Same contract again, for building objects (see BuildingHandleCache
     // below).
     void requestBuildingResolve(uint32_t objectCrc) { buildingJobs_.push(objectCrc); }
+
+    // Registers real terrain grading (footprint flattening, see
+    // RealBuildingResolver::resolveGradingLay()'s own comment) for a
+    // building instance - called once per real objectId the first time it's
+    // seen with a successfully-resolved buildingCells, matching
+    // requestBuildingResolve()'s own "first-seen" caller discipline. Unlike
+    // the resolve-by-objectCrc jobs above, grading is keyed by objectId
+    // (per-instance world position), not objectCrc (per-template geometry)
+    // - the same building template placed at two different positions needs
+    // two independent grading registrations.
+    void requestGrading(uint64_t objectId, uint32_t objectCrc, float worldX, float worldZ) {
+        gradingJobs_.push(GradingRequest{objectId, objectCrc, worldX, worldZ});
+    }
+
+    // Un-registers a building's grading (real structure destroyed) - called
+    // once the render loop no longer sees a previously-graded objectId.
+    void requestUngrading(uint64_t objectId) { ungradingJobs_.push(objectId); }
 
     // Called from the render thread once per frame - cheap (just an atomic
     // store), read by this thread's own loop to know where to stream
@@ -1584,6 +1774,66 @@ private:
                 buildingReady.push(BuildingReady{*objectCrc, std::move(result)});
             }
 
+            if (auto job = gradingJobs_.tryPop()) {
+                didWork = true;
+                if (proceduralTerrainSource_) {
+                    // Template-scoped: the expensive part (extracting +
+                    // parsing the real .lay file) only happens once per
+                    // distinct objectCrc, cached forever - every instance of
+                    // the same building template reuses the parsed,
+                    // still-untranslated generator.
+                    auto cacheIt = gradingTemplateCache_.find(job->objectCrc);
+                    if (cacheIt == gradingTemplateCache_.end()) {
+                        cacheIt = gradingTemplateCache_
+                                      .emplace(job->objectCrc,
+                                               buildingResolver_.resolveGradingLay(job->objectCrc))
+                                      .first;
+                    }
+                    if (cacheIt->second.has_value()) {
+                        // Per-instance: copy the template generator, then
+                        // translate its boundaries + bake its flatten
+                        // height to THIS instance's real world position -
+                        // mirrors Core3's ProceduralTerrainAppearance::
+                        // addTerrainModification() exactly (translateBoundary
+                        // + setHeight using the PRE-modification height
+                        // sampled at (x,z)).
+                        terrain::TerrainGenerator instanceGenerator = *cacheIt->second;
+                        float currentHeight =
+                            proceduralTerrainSource_->queryHeight(job->worldX, job->worldZ);
+                        for (auto& layer : instanceGenerator.topLevelLayers) {
+                            terrain::translateLayerBoundaries(layer, job->worldX, job->worldZ);
+                            terrain::bakeLayerHeight(layer, currentHeight);
+                        }
+                        proceduralTerrainSource_->addTerrainModification(job->objectId,
+                                                                          std::move(instanceGenerator));
+                        gradedPositions_[job->objectId] = {job->worldX, job->worldZ};
+                        if (terrainChunkManager_) {
+                            terrainChunkManager_->invalidateChunksOverlapping(
+                                job->worldX, job->worldZ, kGradingInvalidationRadiusMeters);
+                        }
+                        std::cout << "[GRADING] applied objectId=" << job->objectId << " objectCrc=0x"
+                                   << std::hex << job->objectCrc << std::dec << " at (" << job->worldX
+                                   << ", " << job->worldZ << ")\n";
+                    }
+                }
+            }
+
+            if (auto objectId = ungradingJobs_.tryPop()) {
+                didWork = true;
+                if (proceduralTerrainSource_) {
+                    proceduralTerrainSource_->removeTerrainModification(*objectId);
+                    auto posIt = gradedPositions_.find(*objectId);
+                    if (posIt != gradedPositions_.end()) {
+                        if (terrainChunkManager_) {
+                            terrainChunkManager_->invalidateChunksOverlapping(
+                                posIt->second.first, posIt->second.second,
+                                kGradingInvalidationRadiusMeters);
+                        }
+                        gradedPositions_.erase(posIt);
+                    }
+                }
+            }
+
             if (terrainChunkManager_) {
                 float x = selfX_.load(std::memory_order_relaxed);
                 float z = selfZ_.load(std::memory_order_relaxed);
@@ -1630,10 +1880,22 @@ private:
         }
     }
 
+    // Real per-building footprint radius isn't known client-side (see
+    // RealBuildingResolver::resolveGradingLay()'s own comment on why the
+    // real filename mapping is a heuristic) - a generous fixed radius that
+    // comfortably covers any real player-house/guildhall `.lay` file's own
+    // boundary + feather, confirmed by eye against this project's real
+    // player-house footprints, used only to decide which already-generated
+    // terrain chunks need to be thrown away and regenerated after a grading
+    // change (an overly generous radius just means a few extra harmless
+    // chunk regenerations, never a correctness problem).
+    static constexpr float kGradingInvalidationRadiusMeters = 64.0f;
+
     RealMeshResolver& meshResolver_;
     RealSkeletalMeshResolver& skeletalMeshResolver_;
     RealBuildingResolver& buildingResolver_;
     std::unique_ptr<terrain::TerrainChunkManager> terrainChunkManager_;
+    std::shared_ptr<terrain::ProceduralTerrainSource> proceduralTerrainSource_;
     std::unordered_set<terrain::ChunkCoord, terrain::ChunkCoordHash> knownTerrainCoords_;
     std::atomic<float> selfX_{0.0f};
     std::atomic<float> selfZ_{0.0f};
@@ -1642,6 +1904,16 @@ private:
     soe::ThreadSafeQueue<uint32_t> meshJobs_;
     soe::ThreadSafeQueue<uint32_t> skeletalMeshJobs_;
     soe::ThreadSafeQueue<uint32_t> buildingJobs_;
+    soe::ThreadSafeQueue<GradingRequest> gradingJobs_;
+    soe::ThreadSafeQueue<uint64_t> ungradingJobs_;
+    // Worker-thread-only state (never touched by the render thread) - the
+    // parsed-but-untranslated per-template `.lay` generator (keyed by
+    // objectCrc, cached forever like every other resolver cache in this
+    // class) and each currently-graded instance's real world position
+    // (keyed by objectId, needed to invalidate the right terrain chunks on
+    // removal).
+    std::unordered_map<uint32_t, std::optional<terrain::TerrainGenerator>> gradingTemplateCache_;
+    std::unordered_map<uint64_t, std::pair<float, float>> gradedPositions_;
 };
 
 // Render-thread-side cache of resolved mesh handles (Phase 14) - fed by
@@ -1795,6 +2067,23 @@ struct CellHandles {
 // project's own established convention), so this is roughly a doorway's
 // own real width.
 constexpr float kCellBoundsMarginMeters = 1.0f;
+
+// Real, live-caught gap (2026-07-28): a real entrance ramp exists
+// specifically to let a structure sit on varying/sloped terrain (the
+// building adapts to the ground, not vice versa) - it extends outward from
+// the building's own compact footprint well past kCellBoundsMarginMeters,
+// to actually reach natural grade (real measured data: self's own local Z
+// reached 43.98 against a bare cell-0 max.z of 32.5 - the real ramp
+// extends >11m past the compact box). A first fix tried widening
+// kCellBoundsMarginMeters itself, which is WRONG - that same constant also
+// gates wall-blocking/persistent-cell/portal-crossing logic, and widening
+// it uniformly let real stair-riser geometry register as wall hits well
+// outside the building's real interior, breaking movement that worked
+// before (a real, live-caught regression, reverted). This SEPARATE,
+// floor-height-fallback-only margin (see its real single call site in the
+// main per-frame movement/collision block) is sized from the real
+// measurement above with headroom, not guessed.
+constexpr float kFloorFallbackMarginMeters = 20.0f;
 
 // Which real cell (by index) `localPos` (already in this building's own
 // local mesh space - see worldToBuildingLocal()) falls inside (padded by
@@ -2043,6 +2332,94 @@ std::optional<FloorHit2D> queryFloorHeight2DFullScan(const assets::FloorCollisio
         }
     }
     return best;
+}
+
+// Real 3D nearest-point floor query (2026-07-29, ramp/porch fix attempt 3 -
+// replaces two earlier live-failed attempts, still not fully working - see
+// this function's call site). Standard closest-point-on-triangle-in-3D
+// algorithm (Ericson, "Real-Time Collision Detection" 5.1.5), ranked by
+// real 3D distance across every triangle in the mesh, rather than a 2D
+// (X/Z-projected) containment test with a separate height check. Two
+// earlier attempts both failed live because they used a 2D (X/Z-only)
+// proxy instead of real 3D distance: the first used pure X/Z
+// nearest-point-on-edge (no height check at all), the second added a
+// height-proximity tiebreak keyed to a reference Y. Both were heuristics
+// grafted onto 2D containment; this version ranks purely by real 3D
+// distance, which should naturally reject a nearby foundation/skirt edge
+// far below self in Y in favor of a legitimate nearby floor point - but
+// still doesn't fully resolve the live defect (see the call site's own
+// comment) for a reason not yet understood.
+DirectX::XMFLOAT3 closestPointOnTriangle3D(const DirectX::XMFLOAT3& p, const assets::Float3& a,
+                                            const assets::Float3& b, const assets::Float3& c) {
+    float abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
+    float acx = c.x - a.x, acy = c.y - a.y, acz = c.z - a.z;
+    float apx = p.x - a.x, apy = p.y - a.y, apz = p.z - a.z;
+    float d1 = abx * apx + aby * apy + abz * apz;
+    float d2 = acx * apx + acy * apy + acz * apz;
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        return {a.x, a.y, a.z};
+    }
+    float bpx = p.x - b.x, bpy = p.y - b.y, bpz = p.z - b.z;
+    float d3 = abx * bpx + aby * bpy + abz * bpz;
+    float d4 = acx * bpx + acy * bpy + acz * bpz;
+    if (d3 >= 0.0f && d4 <= d3) {
+        return {b.x, b.y, b.z};
+    }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / (d1 - d3);
+        return {a.x + abx * v, a.y + aby * v, a.z + abz * v};
+    }
+    float cpx = p.x - c.x, cpy = p.y - c.y, cpz = p.z - c.z;
+    float d5 = abx * cpx + aby * cpy + abz * cpz;
+    float d6 = acx * cpx + acy * cpy + acz * cpz;
+    if (d6 >= 0.0f && d5 <= d6) {
+        return {c.x, c.y, c.z};
+    }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / (d2 - d6);
+        return {a.x + acx * w, a.y + acy * w, a.z + acz * w};
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return {b.x + (c.x - b.x) * w, b.y + (c.y - b.y) * w, b.z + (c.z - b.z) * w};
+    }
+    float denom = 1.0f / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return {a.x + abx * v + acx * w, a.y + aby * v + acy * w, a.z + abz * v + acz * w};
+}
+
+std::optional<float> queryFloorHeightNearestPoint3D(const assets::FloorCollisionMesh& mesh,
+                                                      const DirectX::XMFLOAT3& localPos,
+                                                      float maxDistance) {
+    if (mesh.positions.empty() || mesh.triangleVertexIndices.empty()) {
+        return std::nullopt;
+    }
+    float bestDistSq = maxDistance * maxDistance;
+    std::optional<float> bestY;
+    size_t triCount = mesh.triangleVertexIndices.size() / 3;
+    for (size_t t = 0; t < triCount; ++t) {
+        size_t i = t * 3;
+        if (i + 2 >= mesh.triangleVertexIndices.size()) {
+            continue;
+        }
+        const auto& v0 = mesh.positions[mesh.triangleVertexIndices[i]];
+        const auto& v1 = mesh.positions[mesh.triangleVertexIndices[i + 1]];
+        const auto& v2 = mesh.positions[mesh.triangleVertexIndices[i + 2]];
+        DirectX::XMFLOAT3 closest = closestPointOnTriangle3D(localPos, v0, v1, v2);
+        float dx = localPos.x - closest.x;
+        float dy = localPos.y - closest.y;
+        float dz = localPos.z - closest.z;
+        float distSq = dx * dx + dy * dy + dz * dz;
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            bestY = closest.y;
+        }
+    }
+    return bestY;
 }
 
 // Real floor height (Phase 20) - casts a ray straight down through the real
@@ -2386,6 +2763,15 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
     RealBuildingResolver buildingResolver(meshResolver);
     BuildingHandleCache buildingCache;
 
+    // Real terrain grading (structure footprint flattening around a placed
+    // building) - tracks which real objectIds have already had a grading
+    // request sent (so it's only ever sent once per instance, not every
+    // frame) and which ones are still actually present each frame (a
+    // building removed from the world needs its grading un-registered -
+    // see the per-frame diff right after the object-store scan below,
+    // mirroring AssetWorkerThread's own terrain-chunk eviction diffing).
+    std::unordered_set<uint64_t> gradedBuildingIds;
+
     // Real terrain (Phase 8 of the terrain plan) - resolved once at
     // startup from the real terrainName CmdStartScene reported at zone-in,
     // reusing meshResolver's already-open data_other_00.tre rather than
@@ -2650,13 +3036,11 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         // Real correction (2026-07-25): an earlier version of this line
         // scaled the PLAYBACK RATE by (real speed / clip's own real LOCT
         // average speed) - live-tested and confirmed WRONG, made the
-        // limbs swing much too fast. Re-reading the real leaked source
-        // (CompressedKeyframeAnimation::getScaledLocomotion) more
-        // carefully: the real client scales the LOCOMOTION TRANSLATION
-        // distance to match real movement speed, explicitly WITHOUT
-        // touching playback rate ("Scale translation appropriately.
-        // Rotation is ignored.") - joints always swing at the clip's own
-        // native authored cadence. Reverted to the original fixed rate;
+        // limbs swing much too fast. The real client instead scales the
+        // LOCOMOTION TRANSLATION distance to match real movement speed,
+        // explicitly WITHOUT touching playback rate - joints always swing
+        // at the clip's own native authored cadence. Reverted to the
+        // original fixed rate;
         // selfLastActiveClipAverageSpeed/the real LOCT data stays parsed
         // and available for a future real translation-distance-scaling
         // fix, just not used to scale time anymore.
@@ -2857,19 +3241,168 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     }
                     const auto& b = *(*cells)[0].bounds;
                     DirectX::XMFLOAT3 oldLocal = worldToBuildingLocal(preMovePos, buildingCandidate);
-                    if (oldLocal.x < b.min.x - kCellBoundsMarginMeters ||
+                    DirectX::XMFLOAT3 newLocal =
+                        worldToBuildingLocal(predictedSelfPos, buildingCandidate);
+
+                    // Real, live-caught gap (2026-07-28): a real entrance
+                    // ramp exists specifically so a structure can sit on
+                    // varying/sloped terrain (the building adapts to the
+                    // ground, not vice versa - confirmed via direct
+                    // observation of a real guildhall's own ramp, and via
+                    // real measured data: self's own local Z reached 43.98
+                    // against a bare max.z of 32.5, i.e. the real ramp
+                    // extends >11m past cell 0's own compact bounding box).
+                    // A FIRST fix (widening kCellBoundsMarginMeters itself
+                    // to 10m) was wrong: that same margin also gates the
+                    // wall-blocking/persistent-cell/portal-crossing logic
+                    // below, and widening it uniformly let real stair-riser
+                    // geometry start registering as wall hits well outside
+                    // the building's real interior, breaking movement that
+                    // worked before. The two concerns need DIFFERENT
+                    // margins: wall-blocking/persistent-cell tracking stays
+                    // on the original tight kCellBoundsMarginMeters (real,
+                    // working stair/doorway behavior, unchanged), while
+                    // ONLY the floor-height fallback (real ramps/porches
+                    // are shell-owned geometry - see the existing shell-
+                    // fallback comment below) gets the wider
+                    // kFloorFallbackMarginMeters, sized from the real
+                    // measurement above with headroom, not guessed.
+                    bool outsideWideFootprint = oldLocal.x < b.min.x - kFloorFallbackMarginMeters ||
+                        oldLocal.x > b.max.x + kFloorFallbackMarginMeters ||
+                        oldLocal.y < b.min.y - kFloorFallbackMarginMeters ||
+                        oldLocal.y > b.max.y + kFloorFallbackMarginMeters ||
+                        oldLocal.z < b.min.z - kFloorFallbackMarginMeters ||
+                        oldLocal.z > b.max.z + kFloorFallbackMarginMeters;
+                    if (outsideWideFootprint) {
+                        return;
+                    }
+                    bool outsideTightFootprint = oldLocal.x < b.min.x - kCellBoundsMarginMeters ||
                         oldLocal.x > b.max.x + kCellBoundsMarginMeters ||
                         oldLocal.y < b.min.y - kCellBoundsMarginMeters ||
                         oldLocal.y > b.max.y + kCellBoundsMarginMeters ||
                         oldLocal.z < b.min.z - kCellBoundsMarginMeters ||
-                        oldLocal.z > b.max.z + kCellBoundsMarginMeters) {
+                        oldLocal.z > b.max.z + kCellBoundsMarginMeters;
+
+                    const CellHandles& shell = (*cells)[0];
+                    // Default: the unblocked candidate position - the
+                    // ramp-only branch below never computes a `blocked`
+                    // flag (no wall test happens out there), so this stays
+                    // as-is for that case; the tight-footprint branch
+                    // overwrites it once `blocked` is known.
+                    DirectX::XMFLOAT3 floorQueryPos = newLocal;
+                    // Real fix (Phase 20c/d): the dedicated .flr navmesh's
+                    // own 2D point-in-triangle query is tried FIRST - it
+                    // can't confuse two vertically-stacked surfaces the way
+                    // the CMSH raycast can. Adjacency-restricted
+                    // (queryFloorHeight2DAdjacent) whenever a persistent
+                    // triangle is already known for THIS source cell -
+                    // that's the ambiguity-free everyday path. Only falls
+                    // back to a full-mesh scan (queryFloorHeight2DFullScan,
+                    // referenced against floorQueryPos.y - self's own
+                    // last-known height, which correctly disambiguates a
+                    // real switchback's upper entrance from its unrelated
+                    // lower flight) on a fresh cell entry, then to the CMSH
+                    // raycast if this cell has no real .flr data at all.
+                    // allowEdgeExtrapolation (2026-07-29): deliberately
+                    // defaulted false and only ever passed true from the
+                    // ramp/porch branch below. The interior/tight-footprint
+                    // call sites intentionally do NOT get this - the "hold
+                    // Y unchanged on a real interior floor-mesh gap" fallback
+                    // a few lines further down (see its own "round 2" bugfix
+                    // comment) was already tuned live once before and an
+                    // over-eager extrapolation there previously caused a
+                    // regression; scoping this fix narrowly to the one real,
+                    // measured problem (the shell's own ramp mesh ending
+                    // ~5m short of where self actually walks) avoids
+                    // reopening that.
+                    auto tryFloorHeight = [&](const CellHandles& source, size_t sourceCellIndex,
+                                               bool allowEdgeExtrapolation = false) {
+                        if (!source.floorMesh.positions.empty()) {
+                            std::optional<FloorHit2D> hit2D;
+                            if (persistentFloorTriangleIndex.has_value() &&
+                                persistentFloorTriangleCellIndex.has_value() &&
+                                *persistentFloorTriangleCellIndex == sourceCellIndex) {
+                                hit2D = queryFloorHeight2DAdjacent(
+                                    source.floorMesh, *persistentFloorTriangleIndex, floorQueryPos);
+                            }
+                            if (!hit2D.has_value()) {
+                                hit2D = queryFloorHeight2DFullScan(source.floorMesh, floorQueryPos,
+                                                                    floorQueryPos.y);
+                            }
+                            if (hit2D.has_value()) {
+                                newFloorHeight = hit2D->y;
+                                persistentFloorTriangleIndex = hit2D->triangleIndex;
+                                persistentFloorTriangleCellIndex = sourceCellIndex;
+                                return;
+                            }
+                            if (allowEdgeExtrapolation) {
+                                // Real 3D nearest-point search (see this
+                                // function's own comment) - localPos already
+                                // carries real Y, so no separate reference
+                                // height is needed the way the 2D-only
+                                // attempts before this one required.
+                                auto nearestY = queryFloorHeightNearestPoint3D(
+                                    source.floorMesh, floorQueryPos, kFloorFallbackMarginMeters);
+                                if (nearestY.has_value()) {
+                                    newFloorHeight = nearestY;
+                                    return;
+                                }
+                            }
+                        }
+                        if (source.collisionMesh.positions.empty()) {
+                            return;
+                        }
+                        auto hit = queryFloorHeight(source.collisionMesh, floorQueryPos);
+                        if (!hit.has_value()) {
+                            return;
+                        }
+                        newFloorHeight = hit;
+                    };
+
+                    if (outsideTightFootprint) {
+                        // Ramp/porch zone: wide margin only. No wall test,
+                        // no persistent-cell/portal-crossing tracking -
+                        // self isn't meaningfully "in a room" out here,
+                        // just walking a real entrance ramp that happens to
+                        // extend past the building's compact interior box.
+                        // buildingWorldY still needs to be set (newFloorHeight
+                        // is in LOCAL space, converted back to world further
+                        // below using this) - same real local-to-world
+                        // bugfix as the tight-footprint case.
+                        buildingWorldY = buildingCandidate.y;
+                        tryFloorHeight(shell, 0, /*allowEdgeExtrapolation=*/true);
+                        // TEMPORARY diagnostic (2026-07-29, ramp fix retest -
+                        // edge-extrapolation fix reported as still not
+                        // working live) - throttled real numbers for every
+                        // frame self is in this ramp/porch ring, so the next
+                        // retest can show exactly what height (if any) got
+                        // picked instead of guessing again. Strip once
+                        // resolved.
+                        {
+                            static int rampDiagCounter = 0;
+                            if ((rampDiagCounter++ % 10) == 0) {
+                                float terrainHeightHere = terrainSource
+                                    ? terrainSource->queryHeight(predictedSelfPos.x, predictedSelfPos.z)
+                                    : -9999.0f;
+                                std::cout << "[RAMP DIAG] local=(" << newLocal.x << "," << newLocal.y
+                                           << "," << newLocal.z << ") newFloorHeight="
+                                           << (newFloorHeight.has_value()
+                                                   ? std::to_string(*newFloorHeight)
+                                                   : std::string("NONE"))
+                                           << " worldY(if used)="
+                                           << (newFloorHeight.has_value()
+                                                   ? std::to_string(buildingWorldY + *newFloorHeight)
+                                                   : std::string("N/A"))
+                                           << " terrainHeightHere=" << terrainHeightHere
+                                           << " predictedSelfPos.y=" << predictedSelfPos.y << "\n";
+                            }
+                        }
                         return;
                     }
+
                     selfInsideAnyBuildingFootprint = true;
                     buildingWorldY = buildingCandidate.y;
 
-                    DirectX::XMFLOAT3 newLocal =
-                        worldToBuildingLocal(predictedSelfPos, buildingCandidate);
                     DirectX::XMFLOAT3 wallTestFrom{oldLocal.x, oldLocal.y + kWallTestHeightMeters,
                                                     oldLocal.z};
                     DirectX::XMFLOAT3 wallTestTo{newLocal.x, newLocal.y + kWallTestHeightMeters,
@@ -2964,7 +3497,6 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     // (see that comment) - blocking doesn't write to Y, so
                     // this can't cause the height-lock feedback bug height
                     // queries did.
-                    const CellHandles& shell = (*cells)[0];
                     if (!shell.collisionMesh.positions.empty() &&
                         segmentBlockedByCollisionMesh(shell.collisionMesh, wallTestFrom,
                                                        wallTestTo)) {
@@ -2989,49 +3521,7 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     // floor hit is correctly converted back to world space,
                     // it can no longer feed a wrong value into next frame's
                     // containment test the way the old bug did.
-                    DirectX::XMFLOAT3 floorQueryPos = blocked ? oldLocal : newLocal;
-                    // Real fix (Phase 20c/d): the dedicated .flr navmesh's
-                    // own 2D point-in-triangle query is tried FIRST - it
-                    // can't confuse two vertically-stacked surfaces the way
-                    // the CMSH raycast can. Adjacency-restricted
-                    // (queryFloorHeight2DAdjacent) whenever a persistent
-                    // triangle is already known for THIS source cell -
-                    // that's the ambiguity-free everyday path. Only falls
-                    // back to a full-mesh scan (queryFloorHeight2DFullScan,
-                    // referenced against floorQueryPos.y - self's own
-                    // last-known height, which correctly disambiguates a
-                    // real switchback's upper entrance from its unrelated
-                    // lower flight) on a fresh cell entry, then to the CMSH
-                    // raycast if this cell has no real .flr data at all.
-                    auto tryFloorHeight = [&](const CellHandles& source, size_t sourceCellIndex) {
-                        if (!source.floorMesh.positions.empty()) {
-                            std::optional<FloorHit2D> hit2D;
-                            if (persistentFloorTriangleIndex.has_value() &&
-                                persistentFloorTriangleCellIndex.has_value() &&
-                                *persistentFloorTriangleCellIndex == sourceCellIndex) {
-                                hit2D = queryFloorHeight2DAdjacent(
-                                    source.floorMesh, *persistentFloorTriangleIndex, floorQueryPos);
-                            }
-                            if (!hit2D.has_value()) {
-                                hit2D = queryFloorHeight2DFullScan(source.floorMesh, floorQueryPos,
-                                                                    floorQueryPos.y);
-                            }
-                            if (hit2D.has_value()) {
-                                newFloorHeight = hit2D->y;
-                                persistentFloorTriangleIndex = hit2D->triangleIndex;
-                                persistentFloorTriangleCellIndex = sourceCellIndex;
-                                return;
-                            }
-                        }
-                        if (source.collisionMesh.positions.empty()) {
-                            return;
-                        }
-                        auto hit = queryFloorHeight(source.collisionMesh, floorQueryPos);
-                        if (!hit.has_value()) {
-                            return;
-                        }
-                        newFloorHeight = hit;
-                    };
+                    floorQueryPos = blocked ? oldLocal : newLocal;
                     if (cellIndex.has_value()) {
                         tryFloorHeight((*cells)[*cellIndex], *cellIndex);
                     }
@@ -3226,6 +3716,14 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
             DirectX::XMMatrixPerspectiveFovLH(DirectX::XM_PIDIV4, aspect, 0.1f, 8192.0f);
         gfx.setViewProjection(viewMatrixNow, projection);
 
+        // Real portal-based cell visibility (Phase 22) - one world-space
+        // frustum built once per frame, reused for every building's
+        // computeVisibleCells() call in the draw pass below (row-vector
+        // convention: combined = view * projection, matching how
+        // gfx.setViewProjection() itself composes them).
+        renderer::Frustum cameraFrustum = renderer::Frustum::fromViewProjection(
+            DirectX::XMMatrixMultiply(viewMatrixNow, projection));
+
         // Real terrain (Phase 8, relocated to a background thread in Phase
         // 14) - tells the asset worker thread where self is (cheap atomic
         // store; the actual generation happens over there, off this
@@ -3285,6 +3783,11 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
         uint32_t hoveredObjectCrc = 0;
         DirectX::XMFLOAT3 hoveredObjectPos{};
         float hoveredDistance = kMaxInteractionDistance;
+
+        // Real terrain grading (see gradedBuildingIds' own comment) - which
+        // already-graded buildings are still actually present this frame,
+        // used for the post-scan removal diff right after this forEach call.
+        std::unordered_set<uint64_t> seenBuildingIdsThisFrame;
 
         objectStore.forEach([&](const auto& obj) {
             using T = std::decay_t<decltype(obj)>;
@@ -3563,6 +4066,16 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     buildingCells = buildingCache.get(obj.objectCrc, assetWorker);
                     if (buildingCells == nullptr) {
                         realMesh = meshCache.get(obj.objectCrc, assetWorker);
+                    } else {
+                        // Real terrain grading - register once per real
+                        // building instance (objectId), the first frame its
+                        // cell layout successfully resolves; already-graded
+                        // instances just get marked seen for the removal
+                        // diff below.
+                        seenBuildingIdsThisFrame.insert(obj.objectId);
+                        if (gradedBuildingIds.insert(obj.objectId).second) {
+                            assetWorker.requestGrading(obj.objectId, obj.objectCrc, objPos.x, objPos.z);
+                        }
                     }
                 }
 
@@ -3610,18 +4123,51 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                     // filter - every cell draws at once (a "dollhouse
                     // cutaway" view for visual/scale assessment), matching
                     // the free noclip camera also active in this mode. The
-                    // gameplay-accurate single-room filter above is
-                    // unchanged for normal play.
+                    // gameplay-accurate filter below is unchanged in spirit
+                    // for normal play - just upgraded (Phase 22) from a
+                    // binary "exterior + self's current cell only" gate to
+                    // real portal-based visibility.
                     std::optional<size_t> selfCellIndexHere;
                     if (!inspectionMode) {
                         DirectX::XMFLOAT3 selfLocalHere = worldToBuildingLocal(predictedSelfPos, obj);
                         selfCellIndexHere = findContainingCellIndex(*buildingCells, selfLocalHere);
                     }
+
+                    // Real portal-based cell visibility (Phase 22) - starts
+                    // the portal graph walk from self's own current cell if
+                    // self is inside THIS building, or cell 0 (exterior)
+                    // otherwise - correctly handles both "a room becomes
+                    // visible through an open door from outside" and "the
+                    // exterior/another room becomes visible through an open
+                    // door from inside" as the same graph. Cell 0 is always
+                    // additionally forced visible, matching this project's
+                    // prior "exterior always draws" behavior - the
+                    // building's own ground-level shape reference shouldn't
+                    // disappear just because no portal chain currently
+                    // reaches it.
+                    std::vector<bool> visibleCells;
+                    if (!inspectionMode && !buildingCells->empty()) {
+                        std::vector<std::vector<assets::CellPortal>> cellPortals;
+                        cellPortals.reserve(buildingCells->size());
+                        for (const auto& resolvedCell : *buildingCells) {
+                            cellPortals.push_back(resolvedCell.portals);
+                        }
+                        size_t startCellIndex = selfCellIndexHere.value_or(0);
+                        visibleCells = worldmodel::computeVisibleCells(
+                            cellPortals, (*buildingCells)[0].portalShapes, startCellIndex,
+                            [&](assets::Float3 localCenter, float radius) {
+                                DirectX::XMFLOAT3 worldCenter = buildingLocalToWorld(
+                                    DirectX::XMFLOAT3{localCenter.x, localCenter.y, localCenter.z}, obj);
+                                return cameraFrustum.intersectsSphere(worldCenter, radius);
+                            });
+                        if (!visibleCells.empty()) {
+                            visibleCells[0] = true;
+                        }
+                    }
+
                     for (size_t cellIndex = 0; cellIndex < buildingCells->size(); ++cellIndex) {
-                        bool isExterior = cellIndex == 0;
-                        bool isSelfsCurrentCell =
-                            selfCellIndexHere.has_value() && cellIndex == *selfCellIndexHere;
-                        if (!inspectionMode && !isExterior && !isSelfsCurrentCell) {
+                        bool isVisible = cellIndex < visibleCells.size() && visibleCells[cellIndex];
+                        if (!inspectionMode && !isVisible) {
                             continue;
                         }
                         for (const auto& submeshHandle : (*buildingCells)[cellIndex].submeshes) {
@@ -3659,6 +4205,22 @@ void runVisualizer(soe::SoeSession& zoneSession, soe::MessageDispatcher& dispatc
                 }
             }
         });
+
+        // Real terrain grading removal - a previously-graded building no
+        // longer seen this frame (real structure destroyed) gets its
+        // grading un-registered. Diffed against gradedBuildingIds rather
+        // than hooked directly into SceneDestroyObject's handler (main.cpp,
+        // outside this function's scope) - mirrors AssetWorkerThread's own
+        // terrain-chunk eviction diffing (knownTerrainCoords_ vs.
+        // loadedChunks()) just above.
+        for (auto it = gradedBuildingIds.begin(); it != gradedBuildingIds.end();) {
+            if (seenBuildingIdsThisFrame.find(*it) == seenBuildingIdsThisFrame.end()) {
+                assetWorker.requestUngrading(*it);
+                it = gradedBuildingIds.erase(it);
+            } else {
+                ++it;
+            }
+        }
 
         // Name labels - a second pass, after every box this frame, since
         // labels use a different shader/blend/topology than

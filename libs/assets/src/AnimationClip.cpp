@@ -78,18 +78,25 @@ constexpr BaseTableEntry kBaseTable[] = {
     {0xfd, 0.333333373f, 1},
 };
 
-// Real, live-extracted per-precision-level scale constants (x32dbg
-// static-memory dump of swgemu.exe:018AF650, same session). Index 0-6
-// matches kBaseTable's own `level` field. `scaleC` is the real scale used
-// for the "low" field (10 bits total: 1 sign + 9 magnitude -
-// swgemu.exe:AC0AD0); `scaleAB` is the real scale used for the "top"/
-// "middle" fields (11 bits total each: 1 sign + 10 magnitude -
-// swgemu.exe:AC0B30). The two real tables sit 8 bytes apart in memory
-// (018AF650 vs 018AF658 - exactly one float's worth), confirming they're
-// really one combined table, not two independent ones.
+// Corrected 2026-07-28: the live x32dbg memory
+// dump captured the right float values but this project had the two
+// columns' ROLES swapped. The real formula is
+// `expandFactorElevenBit = halfRange(level) / 0x3FF` (used for the two
+// 11-bit fields, 10 magnitude bits each) and
+// `expandFactorTenBit = halfRange(level) / 0x1FF` (used for the one 10-bit
+// field, 9 magnitude bits) - verified by recomputing halfRange from the
+// real formula for all 7 levels and matching bit-for-bit against these
+// constants. `scaleElevenBit` (was `scaleC`) is the finer factor for the
+// two 11-bit fields; `scaleTenBit` (was `scaleAB`) is the coarser factor
+// for the one 10-bit field - exactly backwards from how this table's
+// values were being consumed below. Since bind pose is read as plain
+// uncompressed floats (BasicSkeletonTemplate::load_0001/0002), this bug
+// only ever corrupted ANIMATED (QCHN/SROT) rotations, never the bind pose
+// itself - consistent with the earlier isolation test finding the computed
+// bind pose alone was already a correct T-pose.
 struct ScaleTableEntry {
-    float scaleC;
-    float scaleAB;
+    float scaleElevenBit;
+    float scaleTenBit;
 };
 constexpr ScaleTableEntry kScaleTable[7] = {
     {0.000977517f, 0.00195695f},  {0.000651678f, 0.00130463f}, {0.000391007f, 0.000782779f},
@@ -115,9 +122,8 @@ BaseTableEntry lookupBaseTableEntry(uint8_t byte) {
 
 // Real per-keyframe rotation payload decode ("smallest three" quantized
 // quaternion). Phase 21 live x32dbg reverse-engineering of the real,
-// official SWGEmu.exe client (see project memory - traced from the real
-// "SkeletalAnimationTemplate"/"CompressedKeyframeAnimation" string
-// landmarks all the way down to real FPU instructions around
+// official SWGEmu.exe client (traced from real string landmarks in the
+// binary all the way down to real FPU instructions around
 // swgemu.exe:00AC0DE3-00AC0E0F) found the real client's own reconstruction
 // of the dropped (4th, omitted) quaternion component: it computes
 // `sqrt(1 - x*x - y*y - z*z)` via a bare `fsqrt` and stores it directly -
@@ -323,7 +329,7 @@ Quaternion decodeSmallestThreeQuaternion(uint32_t u32, bool skipZNegation, int f
         uint32_t fieldC = u32 & 0x3FFu;         // bits 9-0, 10 bits (1 sign + 9 magnitude)
         auto decodeField11 = [](uint32_t field, uint8_t ctxByte) {
             BaseTableEntry entry = lookupBaseTableEntry(ctxByte);
-            float scale = kScaleTable[entry.level].scaleAB;
+            float scale = kScaleTable[entry.level].scaleElevenBit;
             bool negative = (field & 0x400u) != 0; // bit 10 (top bit of an 11-bit field)
             uint32_t magnitude = field & 0x3FFu;    // bits 0-9, max 1023
             float delta = static_cast<float>(magnitude) * scale;
@@ -331,7 +337,7 @@ Quaternion decodeSmallestThreeQuaternion(uint32_t u32, bool skipZNegation, int f
         };
         auto decodeField10 = [](uint32_t field, uint8_t ctxByte) {
             BaseTableEntry entry = lookupBaseTableEntry(ctxByte);
-            float scale = kScaleTable[entry.level].scaleC;
+            float scale = kScaleTable[entry.level].scaleTenBit;
             bool negative = (field & 0x200u) != 0; // bit 9 (top bit of a 10-bit field)
             uint32_t magnitude = field & 0x1FFu;    // bits 0-8, max 511
             float delta = static_cast<float>(magnitude) * scale;
@@ -466,10 +472,11 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
     // Real fix, live-verified 2026-07-25 (post quaternion-byte-order-fix
     // retest of the Phase 21 finger 'H' axis-fix debug key, previously
     // tested with a negative result under the OLD, byte-order-broken
-    // skeleton parser - that old result no longer applies): the wrist/finger chain
+    // skeleton parser - see project_animation_phase21_inprogress.md's "v3"
+    // section, that old result no longer applies): the wrist/finger chain
     // (this project's own isFingerChainBone list, already widened to
     // include forearm/ulna/wrist) needs Z-negation SKIPPED, unlike every
-    // other bone - direct live A/B against Naritus confirmed fingers curl
+    // other bone - direct live A/B against a live server confirmed fingers curl
     // the correct direction (into the palm, not away from it) only once
     // this is applied. Now the permanent default rather than a manual
     // debug-key toggle.
@@ -498,9 +505,8 @@ std::vector<QuaternionKeyframe> parseQchn(const IffChunk& chunk, const std::stri
 // base/level selectors as a QCHN channel's own 3-byte header) followed by
 // one real uint32 quantized rotation payload - the SAME "smallest three"
 // encoding as a single QCHN keyframe, just one constant value instead of a
-// curve. Confirmed against the leaked original
-// CompressedKeyframeAnimationTemplate::load_0001 source (the real
-// `TAG_SROT` read loop): `xFormat, yFormat, zFormat, compressedRotationValue`
+// curve. Confirmed real byte layout (the `TAG_SROT` read loop):
+// `xFormat, yFormat, zFormat, compressedRotationValue`
 // per entry, no leading count (the real client instead trusts a
 // `staticRotationCount` read earlier from CHNK INFO, which this project's
 // own parser doesn't separately track) - reading until the chunk's own
@@ -549,9 +555,8 @@ std::vector<ScalarKeyframe> parseChnl(const IffChunk& chunk) {
 
 // A real CHNK LOCT: float32 averageTranslationSpeed, then uint16 keyCount,
 // then `keyCount` real [uint16 frame][float32 x][float32 y][float32 z]
-// records (a real, UNCOMPRESSED Vector per keyframe - confirmed directly
-// against the leaked original CompressedKeyframeAnimationTemplate.cpp
-// source, 2026-07-25, not guessed from byte patterns).
+// records (a real, UNCOMPRESSED Vector per keyframe - confirmed real byte
+// layout, 2026-07-25, not guessed from byte patterns).
 void parseLoct(const IffChunk& chunk, AnimationClipData& result) {
     soe::PacketBuffer buf = chunk.data;
     buf.resetReadCursor();
@@ -625,9 +630,8 @@ AnimationClipData AnimationClip::parse(const std::vector<uint8_t>& bytes) {
         // [byte hasRotation][uint16 rotationChannelIndex - index into
         // AROT's QCHN channels when hasRotation!=0, or index into CHNK
         // SROT's static-rotation array when hasRotation==0 - confirmed
-        // 2026-07-28 against the leaked original
-        // TransformInfo::m_rotationChannelIndex/getStaticRotation source;
-        // previously (wrongly) assumed unused in the hasRotation==0 case]
+        // 2026-07-28 real field semantics; previously (wrongly) assumed
+        // unused in the hasRotation==0 case]
         // [byte hasTranslation][uint16 x3 - real ATRN channel indices when
         // hasTranslation != 0 (confirmed only for `root` this session); a
         // real, separate per-bone counter (likely indexing STRN's unread

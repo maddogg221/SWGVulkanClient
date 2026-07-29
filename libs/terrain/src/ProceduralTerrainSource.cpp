@@ -1,5 +1,7 @@
 #include "terrain/ProceduralTerrainSource.h"
 
+#include <algorithm>
+
 namespace terrain {
 
 ProceduralTerrainSource ProceduralTerrainSource::parse(const std::vector<uint8_t>& bytes,
@@ -12,7 +14,28 @@ ProceduralTerrainSource ProceduralTerrainSource::parse(const std::vector<uint8_t
 }
 
 float ProceduralTerrainSource::queryHeight(float worldX, float worldZ) const {
-    return generator_.queryHeight(worldX, worldZ);
+    std::shared_lock lock(*customTerrainMutex_);
+    TerrainGenerator::Point p = generator_.queryPoint(worldX, worldZ);
+    for (const auto& [id, mod] : customTerrain_) {
+        p = mod.queryPoint(worldX, worldZ, p);
+    }
+    return p.height;
+}
+
+void ProceduralTerrainSource::addTerrainModification(uint64_t objectId, TerrainGenerator generator) {
+    std::unique_lock lock(*customTerrainMutex_);
+    auto it = std::find_if(customTerrain_.begin(), customTerrain_.end(),
+                            [objectId](const auto& entry) { return entry.first == objectId; });
+    if (it != customTerrain_.end()) {
+        it->second = std::move(generator);
+    } else {
+        customTerrain_.emplace_back(objectId, std::move(generator));
+    }
+}
+
+void ProceduralTerrainSource::removeTerrainModification(uint64_t objectId) {
+    std::unique_lock lock(*customTerrainMutex_);
+    std::erase_if(customTerrain_, [objectId](const auto& entry) { return entry.first == objectId; });
 }
 
 float ProceduralTerrainSource::chunkWidthInMeters() const {
@@ -33,6 +56,8 @@ ChunkHeightData ProceduralTerrainSource::generateChunk(ChunkCoord coord) const {
     data.worldOriginX = static_cast<float>(coord.chunkX) * chunkWidth;
     data.worldOriginZ = static_cast<float>(coord.chunkZ) * chunkWidth;
 
+    std::shared_lock lock(*customTerrainMutex_);
+
     uint32_t n = data.verticesPerSide;
     data.heights.reserve(static_cast<size_t>(n) * n);
     data.colors.reserve(static_cast<size_t>(n) * n);
@@ -41,8 +66,13 @@ ChunkHeightData ProceduralTerrainSource::generateChunk(ChunkCoord coord) const {
             float worldX = data.worldOriginX + static_cast<float>(x) * data.tileWidthInMeters;
             float worldZ = data.worldOriginZ + static_cast<float>(z) * data.tileWidthInMeters;
             // One combined walk instead of separate queryHeight()+queryColor()
-            // calls - halves real, measured per-chunk generation cost.
+            // calls - halves real, measured per-chunk generation cost. Then
+            // chained through any registered per-building grading
+            // generators, same real semantics as queryHeight() above.
             TerrainGenerator::Point p = generator_.queryPoint(worldX, worldZ);
+            for (const auto& [id, mod] : customTerrain_) {
+                p = mod.queryPoint(worldX, worldZ, p);
+            }
             data.heights.push_back(p.height);
             data.colors.push_back(p.color);
         }

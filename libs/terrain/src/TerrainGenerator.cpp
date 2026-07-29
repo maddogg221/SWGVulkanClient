@@ -57,6 +57,19 @@ TerrainGenerator TerrainGenerator::parse(const assets::IffChunk& tgenForm,
             }
             generator.topLevelLayers.push_back(parseLayer(child));
         }
+    } else {
+        // A real standalone `.lay` terrain-modification file has no FORM
+        // LYRS wrapper at all - its top-level layer(s) sit directly as
+        // FORM LAYR siblings of SGRP/FGRP/RGRP/EGRP/MGRP (confirmed via a
+        // real-bytes walk of terrain/ply_tatt_house_sml_s01.lay; see
+        // Family.cpp's own kTagLAYR case, which tolerates rather than
+        // throws on this shape). A real .trn always has LYRS, so this
+        // fallback only ever fires for the standalone-.lay path.
+        for (const auto& child : versionForm.children) {
+            if (child.id == assets::kFormTag && child.formType == kTagLAYR) {
+                generator.topLevelLayers.push_back(parseLayer(child));
+            }
+        }
     }
 
     for (const FractalFamily& family : generator.families.fractalFamilies) {
@@ -82,6 +95,29 @@ TerrainGenerator TerrainGenerator::parse(const assets::IffChunk& tgenForm,
     }
 
     return generator;
+}
+
+TerrainGenerator TerrainGenerator::parseStandalone(const std::vector<uint8_t>& layBytes,
+                                                     const assets::TreArchive* textureArchive) {
+    // A real standalone `.lay` terrain-modification file's raw IffReader
+    // parse is a flat list of top-level sibling FORMs (SGRP/FGRP/RGRP/EGRP/
+    // MGRP/LAYR) with no enclosing FORM TGEN -> FORM 0000 wrapper, unlike a
+    // real .trn (confirmed via a real-bytes walk of
+    // terrain/ply_tatt_house_sml_s01.lay). Synthesize that wrapper in memory
+    // and delegate to parse() unchanged, rather than duplicating its logic.
+    std::vector<assets::IffChunk> topLevel = assets::IffReader::parse(layBytes);
+
+    assets::IffChunk versionForm;
+    versionForm.id = assets::kFormTag;
+    versionForm.formType = versionTag(0);
+    versionForm.children = std::move(topLevel);
+
+    assets::IffChunk tgenForm;
+    tgenForm.id = assets::kFormTag;
+    tgenForm.formType = kTagTGEN;
+    tgenForm.children.push_back(std::move(versionForm));
+
+    return parse(tgenForm, textureArchive);
 }
 
 const MultiFractal* TerrainGenerator::findFractalNoise(int familyId) const {
@@ -339,13 +375,17 @@ float computeBoundaryCombined(const Layer& layer, float worldX, float worldZ) {
 constexpr float kNormalSampleDistanceMeters = 1.0f;
 
 GeneratorPoint queryPointImpl(const TerrainGenerator& gen, float worldX, float worldZ,
-                               bool allowSlopeDirection);
+                               bool allowSlopeDirection, GeneratorPoint point);
 
 assets::Float3 computeNormal(const TerrainGenerator& gen, float worldX, float worldZ) {
-    float hL = queryPointImpl(gen, worldX - kNormalSampleDistanceMeters, worldZ, false).height;
-    float hR = queryPointImpl(gen, worldX + kNormalSampleDistanceMeters, worldZ, false).height;
-    float hD = queryPointImpl(gen, worldX, worldZ - kNormalSampleDistanceMeters, false).height;
-    float hU = queryPointImpl(gen, worldX, worldZ + kNormalSampleDistanceMeters, false).height;
+    float hL = queryPointImpl(gen, worldX - kNormalSampleDistanceMeters, worldZ, false, GeneratorPoint{})
+                   .height;
+    float hR = queryPointImpl(gen, worldX + kNormalSampleDistanceMeters, worldZ, false, GeneratorPoint{})
+                   .height;
+    float hD = queryPointImpl(gen, worldX, worldZ - kNormalSampleDistanceMeters, false, GeneratorPoint{})
+                   .height;
+    float hU = queryPointImpl(gen, worldX, worldZ + kNormalSampleDistanceMeters, false, GeneratorPoint{})
+                   .height;
     return normalFromHeightSamples(hL, hR, hD, hU, kNormalSampleDistanceMeters);
 }
 
@@ -621,8 +661,7 @@ void applyLayer(const Layer& layer, float worldX, float worldZ, float previousAm
 }
 
 GeneratorPoint queryPointImpl(const TerrainGenerator& gen, float worldX, float worldZ,
-                               bool allowSlopeDirection) {
-    GeneratorPoint point;
+                               bool allowSlopeDirection, GeneratorPoint point) {
     for (const auto& layer : gen.topLevelLayers) {
         applyLayer(layer, worldX, worldZ, 1.0f, gen, allowSlopeDirection, point);
     }
@@ -632,19 +671,32 @@ GeneratorPoint queryPointImpl(const TerrainGenerator& gen, float worldX, float w
 } // namespace
 
 float TerrainGenerator::queryHeight(float worldX, float worldZ) const {
-    return queryPointImpl(*this, worldX, worldZ, true).height;
+    return queryPointImpl(*this, worldX, worldZ, true, GeneratorPoint{}).height;
 }
 
 assets::Rgb8 TerrainGenerator::queryColor(float worldX, float worldZ) const {
-    return queryPointImpl(*this, worldX, worldZ, true).color;
+    return queryPointImpl(*this, worldX, worldZ, true, GeneratorPoint{}).color;
 }
 
 int TerrainGenerator::queryShaderId(float worldX, float worldZ) const {
-    return queryPointImpl(*this, worldX, worldZ, true).shaderFamilyId;
+    return queryPointImpl(*this, worldX, worldZ, true, GeneratorPoint{}).shaderFamilyId;
 }
 
 TerrainGenerator::Point TerrainGenerator::queryPoint(float worldX, float worldZ) const {
-    return queryPointImpl(*this, worldX, worldZ, true);
+    return queryPointImpl(*this, worldX, worldZ, true, GeneratorPoint{});
+}
+
+TerrainGenerator::Point TerrainGenerator::queryPoint(float worldX, float worldZ,
+                                                      Point startingPoint) const {
+    // Real Core3 chaining semantics (ProceduralTerrainAppearance::getHeight()):
+    // one running Point is threaded sequentially through the main planet
+    // generator, then every registered per-building terrain-modification
+    // generator in insertion order - a TGO_replace affector lerps against
+    // whatever the chain already produced, not a generator-local default.
+    // This overload lets a caller (ProceduralTerrainSource, chaining
+    // multiple TerrainGenerator instances) supply that running value instead
+    // of always restarting from Point{}.
+    return queryPointImpl(*this, worldX, worldZ, true, startingPoint);
 }
 
 } // namespace terrain

@@ -36,9 +36,8 @@ XMVECTOR toXMQuat(const Quaternion& q) {
     return XMVectorSet(q.x, q.y, q.z, q.w);
 }
 
-// SOE's own real quaternion Hamilton product (lhs*rhs), read directly from
-// the leaked original Quaternion.cpp (Quaternion::operator*) - reimplemented
-// by hand rather than using DirectXMath's XMQuaternionMultiply, which
+// The platform's own real quaternion Hamilton product (lhs*rhs) -
+// reimplemented by hand rather than using DirectXMath's XMQuaternionMultiply, which
 // documents computing Q2*Q1 (REVERSED argument order, for compatibility
 // with its own row-vector matrix convention) - using it directly here would
 // silently apply the real formula's three terms in the wrong order. This
@@ -189,6 +188,16 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                     case 4: v.x = -v.x; v.y = -v.y; v.z = -v.z; break;
                     case 5: std::swap(v.y, v.z); break;
                     case 6: std::swap(v.y, v.z); v.z = -v.z; break;
+                    case 7:
+                        // Real, independently-confirmed conversion from
+                        // io_scene_swg_msh (nostyleguy), an actively
+                        // maintained, community-used Blender addon for
+                        // this exact .skt format - negates X AND Y
+                        // together, leaves Z/W untouched. Never tried as
+                        // its own combination in variants 1-6 above.
+                        v.x = -v.x;
+                        v.y = -v.y;
+                        break;
                     default: break;
                 }
                 return XMVectorSet(v.x, v.y, v.z, v.w);
@@ -230,9 +239,10 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                 // AnimationBoneChannel::hasStaticRotation's own comment).
                 // Applying it here means bones like lWrist/lUlna (confirmed
                 // to have no animated rotation channel in the idle-breathe
-                // clip) get their real authored rest offset instead of
-                // silently staying at raw `.skt` bind pose for the bone's
-                // own local rotation.
+                // clip - see project_animation_phase21_inprogress.md's
+                // "Fourth session" section) get their real authored rest
+                // offset instead of silently staying at raw `.skt` bind
+                // pose for the bone's own local rotation.
                 animRot = XMVectorSet(channel.staticRotation.x, channel.staticRotation.y,
                                        channel.staticRotation.z, channel.staticRotation.w);
                 hasAnimRot = true;
@@ -312,10 +322,8 @@ std::vector<XMMATRIX> sampleLocalBoneTransforms(const SkeletonData& skeleton,
                 : rotationCompositionVariant;
         XMVECTOR rotation;
         if (useRealBindPoseFormula) {
-            // Real-client-confirmed formula (read directly from the leaked
-            // original source, Skeleton::calculateJointToRootTransforms /
-            // BasicSkeletonTemplate::buildModelToJointTransforms - see
-            // SkeletalPose.h's own comment on this parameter):
+            // Real-client-confirmed formula (see SkeletalPose.h's own
+            // comment on this parameter for how this was confirmed):
             //   animatedRotation = animationResolverRotation * bindPoseRotation
             //   localRotation    = postRotation * (animatedRotation * preRotation)
             // animationResolverRotation is identity for bind pose (no clip,
@@ -553,7 +561,7 @@ void skinSubmeshVertices(const SkeletalMeshSubmesh& submesh,
     //       multiple frames, WITH real seam-continuity checks between
     //       adjacent bones (all passed, small real gaps, no tears) - and
     //       STILL made the live result worse, not better, when actually
-    //       tested against Naritus.
+    //       tested against a live server.
     // v2's real, most likely bug, understood only after the fact: this
     // correction is computed independently INSIDE each separate call to
     // `skinSubmeshVertices` - one call per body-part submesh (body, arms,

@@ -1,5 +1,6 @@
 #include "terrain/TerrainChunkManager.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -71,6 +72,33 @@ bool TerrainChunkManager::loadOneMissingChunk(float worldX, float worldZ) {
 const std::unordered_map<ChunkCoord, ChunkHeightData, ChunkCoordHash>&
 TerrainChunkManager::loadedChunks() const {
     return loaded_;
+}
+
+void TerrainChunkManager::invalidateChunksOverlapping(float worldX, float worldZ,
+                                                        float radiusMeters) {
+    if (!source_ || source_->chunkWidthInMeters() <= 0.0f) {
+        return;
+    }
+    float chunkWidth = source_->chunkWidthInMeters();
+    for (auto it = loaded_.begin(); it != loaded_.end();) {
+        float chunkMinX = static_cast<float>(it->first.chunkX) * chunkWidth;
+        float chunkMinZ = static_cast<float>(it->first.chunkZ) * chunkWidth;
+        float chunkMaxX = chunkMinX + chunkWidth;
+        float chunkMaxZ = chunkMinZ + chunkWidth;
+
+        // Real circle-vs-AABB overlap test: closest point on the chunk's
+        // AABB to (worldX, worldZ), compared against radiusMeters.
+        float closestX = std::clamp(worldX, chunkMinX, chunkMaxX);
+        float closestZ = std::clamp(worldZ, chunkMinZ, chunkMaxZ);
+        float dx = worldX - closestX;
+        float dz = worldZ - closestZ;
+
+        if ((dx * dx + dz * dz) <= (radiusMeters * radiusMeters)) {
+            it = loaded_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace terrain

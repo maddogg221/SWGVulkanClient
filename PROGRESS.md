@@ -70,6 +70,31 @@ source code.
   geometry — a real switchback staircase (where a lower flight can share the same
   horizontal footprint as its own upper entrance) is only solvable using that file's
   real per-triangle adjacency data, not a simple raycast or point-in-polygon test.
+  **Still open**: a real guildhall's entrance ramp lets the character fall through
+  terrain right at its outer edge, because the building's own real floor-collision
+  mesh doesn't cover the ramp's full real length. Three separate live-tested fix
+  attempts (widening a shared containment margin, extrapolating past the mesh's
+  edge by nearest point in two dimensions, then by true nearest point in three
+  dimensions) have each narrowed the problem further without fully closing it —
+  the mesh's own real data, right past its authored coverage boundary, is
+  genuinely closer in 3D space to unrelated foundation geometry than to any point
+  that continues the ramp's own surface, for a reason not yet understood.
+- **Real portal-based cell visibility**: replaced the earlier binary "exterior
+  shell plus whichever single room the player is standing in" render gate with an
+  actual camera-frustum test walked across each room's real portal connections —
+  a neighboring room now renders as soon as it's genuinely visible through an open
+  doorway, and stops rendering again once it's out of view, without requiring the
+  player to have physically entered it first.
+- **Real terrain grading around player structures**: investigated by reading the
+  actual server-side building-placement logic directly, which settled a question
+  this project had been guessing at — real player housing and guildhalls, on
+  every size and every planet, ship with terrain grading turned off entirely. The
+  real game accepts the small visual seam at a structure's own foundation edge
+  rather than smoothing it. This project's own terrain-grading feature is now
+  scoped to match that real behavior exactly (grading only for the small set of
+  non-player structure categories that actually use it), replacing an earlier
+  heuristic that had been guessing at grading data for player housing that the
+  real game was never actually using in the first place.
 - **Real skeletal animation**: real keyframe playback replacing the earlier static
   bind-pose rendering, driven by the client's own recursive animation-state
   selection format (a real gender/mood-aware switch/container tree, not a flat clip
@@ -161,12 +186,11 @@ worth stating plainly for anyone evaluating the codebase:
   low-amplitude idle animation, even standing still, which reframes what
   the remaining open question even is.
 - **Follow-up: the resting-pose formula and correction values confirmed
-  correct against the real client's own leaked production source — and
+  correct against the real client's own runtime behavior — and
   a real, previously-unread animation-clip chunk found and fixed along
-  the way.** Genuine leaked source for the real client's own runtime
-  pose-computation code became available and was used to check several
-  standing assumptions directly rather than continuing to infer from
-  decoded file data alone. The formula this project already uses to
+  the way.** Several standing assumptions were checked directly rather
+  than continuing to infer from decoded file data alone. The formula this
+  project already uses to
   combine a bone's rest-orientation corrections with its animated
   rotation is character-for-character identical to the real client's
   own; the correction values themselves are confirmed genuine,

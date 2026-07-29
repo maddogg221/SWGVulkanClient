@@ -1,6 +1,7 @@
 #include "terrain/Layer.h"
 
 #include <stdexcept>
+#include <variant>
 
 #include "Tags.h"
 
@@ -68,6 +69,47 @@ Layer parseLayer(const assets::IffChunk& layrForm) {
     }
 
     return layer;
+}
+
+void translateLayerBoundaries(Layer& layer, float dx, float dz) {
+    for (Boundary& boundary : layer.boundaries) {
+        std::visit(
+            [&](auto& shape) {
+                using T = std::decay_t<decltype(shape)>;
+                if constexpr (std::is_same_v<T, BoundaryCircle>) {
+                    shape.centerX += dx;
+                    shape.centerZ += dz;
+                } else if constexpr (std::is_same_v<T, BoundaryRectangle>) {
+                    shape.x0 += dx;
+                    shape.x1 += dx;
+                    shape.y0 += dz;
+                    shape.y1 += dz;
+                } else { // BoundaryPolygon, BoundaryPolyline - both { points: vector<Float2> }
+                    for (assets::Float2& point : shape.points) {
+                        point.x += dx;
+                        point.y += dz;
+                    }
+                }
+            },
+            boundary.shape);
+    }
+    for (Layer& subLayer : layer.subLayers) {
+        translateLayerBoundaries(subLayer, dx, dz);
+    }
+}
+
+void bakeLayerHeight(Layer& layer, float height) {
+    constexpr int kTgoReplace = 0;
+    for (Affector& affector : layer.affectors) {
+        AffectorHeightConstant* heightConstant = std::get_if<AffectorHeightConstant>(&affector.affector);
+        if (heightConstant != nullptr && heightConstant->operation == kTgoReplace &&
+            heightConstant->height == 0.0f) {
+            heightConstant->height = height;
+        }
+    }
+    for (Layer& subLayer : layer.subLayers) {
+        bakeLayerHeight(subLayer, height);
+    }
 }
 
 } // namespace terrain

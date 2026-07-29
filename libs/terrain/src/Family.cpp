@@ -342,6 +342,18 @@ FamilyGroups parseFamilyGroups(const assets::IffChunk& tgenVersionForm) {
                     // Layer tree parsing is Layer.h's concern - skip here, the
                     // caller (TerrainGenerator::parse) handles LYRS separately.
                     break;
+                case kTagLAYR:
+                    // A real standalone `.lay` terrain-modification file (see
+                    // TerrainGenerator::parseStandalone()) has no enclosing
+                    // FORM LYRS around its layer tree - its single top-level
+                    // layer sits directly as a sibling of SGRP/FGRP/RGRP/EGRP/
+                    // MGRP, confirmed via a real-bytes walk of
+                    // terrain/ply_tatt_house_sml_s01.lay. TerrainGenerator::
+                    // parse()'s own LYRS-fallback scan handles it; skip here
+                    // exactly like LYRS above. A real .trn never has a
+                    // top-level LAYR (always wrapped in LYRS), so this case
+                    // only ever fires for the standalone-.lay path.
+                    break;
                 default:
                     throw std::runtime_error("terrain: TGEN: unrecognized top-level child tag");
             }

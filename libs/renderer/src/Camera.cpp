@@ -114,4 +114,56 @@ XMMATRIX FollowCamera::viewMatrix(const XMFLOAT3& targetPosition) const {
     return XMMatrixLookAtLH(eyeVec, targetVec, upVec);
 }
 
+namespace {
+// Normalizes a plane's (a,b,c,d) so (a,b,c) is unit length - needed for
+// intersectsSphere()'s distance test to be in real world units.
+XMFLOAT4 normalizePlane(XMFLOAT4 p) {
+    float lengthSq = p.x * p.x + p.y * p.y + p.z * p.z;
+    if (lengthSq > 1e-12f) {
+        float invLength = 1.0f / sqrtf(lengthSq);
+        p.x *= invLength;
+        p.y *= invLength;
+        p.z *= invLength;
+        p.w *= invLength;
+    }
+    return p;
+}
+} // namespace
+
+Frustum Frustum::fromViewProjection(XMMATRIX viewProj) {
+    XMFLOAT4X4 m;
+    XMStoreFloat4x4(&m, viewProj);
+
+    // Gribb/Hartmann extraction for DirectXMath's row-vector convention
+    // (clip = v * M, v a row vector): clip.x/.y/.z/.w are each a dot
+    // product of v with a COLUMN of M (column j = (_1j, _2j, _3j, _4j) in
+    // this row-major _mn indexing), NOT a row - the frustum planes are
+    // therefore linear combinations of M's columns. D3D's [0,1] depth
+    // range is why the near plane is column2 alone, not column3+column2
+    // (the OpenGL [-1,1]-depth version of this algorithm).
+    Frustum f;
+    f.planes[0] = normalizePlane({m._11 + m._14, m._21 + m._24, m._31 + m._34,
+                                   m._41 + m._44}); // left
+    f.planes[1] = normalizePlane({m._14 - m._11, m._24 - m._21, m._34 - m._31,
+                                   m._44 - m._41}); // right
+    f.planes[2] = normalizePlane({m._12 + m._14, m._22 + m._24, m._32 + m._34,
+                                   m._42 + m._44}); // bottom
+    f.planes[3] = normalizePlane({m._14 - m._12, m._24 - m._22, m._34 - m._32,
+                                   m._44 - m._42}); // top
+    f.planes[4] = normalizePlane({m._13, m._23, m._33, m._43});           // near
+    f.planes[5] = normalizePlane({m._14 - m._13, m._24 - m._23, m._34 - m._33,
+                                   m._44 - m._43}); // far
+    return f;
+}
+
+bool Frustum::intersectsSphere(XMFLOAT3 center, float radius) const {
+    for (const XMFLOAT4& p : planes) {
+        float distance = p.x * center.x + p.y * center.y + p.z * center.z + p.w;
+        if (distance < -radius) {
+            return false; // fully outside this one plane -> outside the frustum
+        }
+    }
+    return true;
+}
+
 } // namespace renderer
